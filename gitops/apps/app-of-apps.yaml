@@ -1,0 +1,29 @@
+# Raiz do GitOps do repositorio k8s-arm-oci-always-free_standart: cria o(s) AppProject(s) e as Applications abaixo.
+# Bootstrap (uma vez):  bash gitops/bootstrap/01-aplicar-padrao-argocd.sh
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: adailsilva-app-of-apps
+  namespace: argocd
+  labels:
+    adailsilva.com.br/repositorio: k8s-arm-oci-always-free_standart
+    adailsilva.com.br/projeto: "adailsilva"
+    adailsilva.com.br/sistema: gitops
+    adailsilva.com.br/componente: app-of-apps
+    adailsilva.com.br/implantacao: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: 01-adailsilva
+  source:
+    repoURL: https://github.com/AdailSilva/k8s-arm-oci-always-free_standart.git
+    targetRevision: master
+    path: gitops/apps
+    directory:
+      recurse: false
+      include: '{appproject-00-plataforma.yaml,appproject-01-adailsilva.yaml,plataforma-metrics-server.yaml,plataforma-udp-health-check.yaml,plataforma-portainer.yaml,adailsilva-site-frontend.yaml}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }

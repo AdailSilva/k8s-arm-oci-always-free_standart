@@ -1,0 +1,27 @@
+# AppProject 01-adailsilva — agrupa e restringe as Applications 'adailsilva-*' no ArgoCD.
+# O nome comeca pelo numero do repositorio: a lista de projetos da UI fica na ordem 00 -> 06.
+# Aplicado uma vez a mao no bootstrap (o app-of-apps precisa dele) e depois mantido pelo app-of-apps.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: 01-adailsilva
+  namespace: argocd
+  labels:
+    adailsilva.com.br/repositorio: k8s-arm-oci-always-free_standart
+    adailsilva.com.br/projeto: "adailsilva"
+  annotations:
+    # Antes das Applications que o referenciam.
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  description: "01 · Adail Silva — site k8s.adailsilva.com.br (repositório k8s-arm-oci-always-free_standart)"
+  sourceRepos:
+    - https://github.com/AdailSilva/k8s-arm-oci-always-free_standart.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: 'adailsilva-*'
+    - server: https://kubernetes.default.svc
+      namespace: 'argocd'
+  # Recursos de cluster permitidos. Namespace: exigido pelo CreateNamespace=true.
+  clusterResourceWhitelist:
+    - group: ''
+      kind: Namespace

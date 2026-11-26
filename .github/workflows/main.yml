@@ -1,0 +1,1508 @@
+# Conteúdo para pipeline do GitHub Actions na raíz do projeto.
+## .github/workflows/main.yml
+#
+# Repositório: AdailSilva/k8s-arm-oci-always-free_standart — padrão comum aos repositórios do cluster.
+#
+# WORKFLOW ÚNICO: um "detect" + um job por aplicação. Só roda o job
+# da aplicação que mudou (paths-filter) ou a escolhida no workflow_dispatch.
+#
+#   Sistemas deste repositório
+#     app_adailsilva_site_frontend → 04.homepage/app_adailsilva_site_frontend/** (k8s.adailsilva.com.br)
+#
+#   Plataforma do cluster (metrics-server, UDP health check do NLB e Portainer CE): jobs plataforma_*
+#   deste arquivo (este repositório é o dono: builda a imagem UDP e grava o newTag).
+#
+# Para adicionar uma aplicação: 1 filtro no detect (+ caso no workflow_dispatch),
+# 1 output no detect, 1 job com `needs: detect` + `if:` no output, e a pasta no
+# force_deploy.sh.
+#
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDEM DE DEPLOY -- TUDO NESTE WORKFLOW
+#   detect → aprovação → [01 metrics-server · 02 UDP health check (NLB OCI) · 03 Portainer CE · 04 homepage, em paralelo] → demais sistemas
+# Cada etapa só começa depois da anterior. Etapa sem alteração fica "skipped" e libera a
+# seguinte na hora; etapa que FALHA bloqueia todas as seguintes.
+# Os jobs plataforma_* são iguais nos 6 repositórios: o dono
+# (repositório 01) builda a imagem UDP e grava o newTag; os demais só pedem o Sync ao
+# ArgoCD e verificam. Este repositório não tem outro workflow.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI/CD with GitHub Actions
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      # Sistemas deste repositório
+      - '04.homepage/app_adailsilva_site_frontend/**'
+      # Plataforma do cluster (jobs plataforma_*: metrics-server e UDP health check do NLB)
+      - '01.metrics_server/kubernetes/**'
+      - '01.metrics_server/.force-deploy'
+      - '03.portainer_ce/kubernetes/**'
+      - '03.portainer_ce/.force-deploy'
+      - '02.udp_health_check-nlb_oci/Dockerfile'
+      - '02.udp_health_check-nlb_oci/UdpHealthCheckServer.java'
+      - '02.udp_health_check-nlb_oci/kubernetes/**'
+      - '02.udp_health_check-nlb_oci/.force-deploy'
+      - 'gitops/apps/plataforma-*.yaml'
+      # GitOps: o commit do newTag (pipeline ou rollback manual) nao dispara build. O
+      # [skip ci] da mensagem ja bastaria; a exclusao e a segunda trava contra loop de CI.
+      # (Exclusoes SEMPRE por ultimo: no on.push.paths a ordem dos padroes importa.)
+      - '!04.homepage/app_adailsilva_site_frontend/kubernetes/kustomization.yaml'
+      - '!02.udp_health_check-nlb_oci/kubernetes/kustomization.yaml'
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Tipo de versão das imagens: minor (padrão) ou major'
+        type: choice
+        required: false
+        default: 'minor'
+        options:
+          - minor
+          - major
+      target:
+        description: 'O que deployar'
+        type: choice
+        required: false
+        default: 'todos'
+        options:
+          - todos
+          - app-adailsilva-site-frontend
+          - metrics-server
+          - udp-health-check
+          - portainer
+          - plataforma
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONCORRENCIA
+# Os jobs de deploy empurram commit de newTag para o MESMO repositorio.
+# Com um workflow so, um unico grupo serializa TODAS as execucoes -- antes, os dois
+# workflows tinham grupos diferentes e podiam disputar o push entre si. O retry de
+# cada passo "Fixar versão no GitOps" continua como rede de seguranca.
+# cancel-in-progress: false e essencial -- a execucao anterior precisa TERMINAR,
+# nao morrer no meio de um push, o que deixaria o GitOps sem o newTag novo.
+# ─────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: gitops-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Repositorio dono da plataforma (o unico que builda a imagem UDP e grava o newTag).
+  DONO_PLATAFORMA: AdailSilva/k8s-arm-oci-always-free_standart
+
+jobs:
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB: DETECT – limpa o disco do runner e descobre
+# quais aplicações mudaram. Em workflow_dispatch usa o input `target`.
+# ─────────────────────────────────────────────────────────────────────────────
+  detect:
+    name: Detectar alterações
+    #runs-on: ubuntu-latest
+    # ─── RUNNER ARM64 EXPLICITO ───────────────────────────────
+    # Todos os jobs deste arquivo exigem ARM64 (kubectl/kubeconfig, OCI CLI em
+    # /home/ubuntu e build nativo ARM64). Os runners sao registrados POR
+    # repositorio (dois por worker; o deste repositorio e o
+    # worker-0-standart-runner), entao [self-hosted, Linux, ARM64] ja basta --
+    # o label worker-N nao e necessario.
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 10
+    outputs:
+      dono:                          ${{ steps.papel.outputs.dono }}
+      app_adailsilva_site_frontend:  ${{ steps.decisao.outputs.app_adailsilva_site_frontend }}
+      metrics_server:                ${{ steps.decisao.outputs.metrics_server }}
+      portainer:                     ${{ steps.decisao.outputs.portainer }}
+      udp_health_check:              ${{ steps.decisao.outputs.udp_health_check }}
+      algum:                             ${{ steps.decisao.outputs.algum }}
+    steps:
+      # ─── LIMPEZA DE DISCO DO RUNNER ───────────────────────────
+      # O runner self-hosted mora no worker-0, que TAMBEM e no do Kubernetes. O
+      # Docker do runner (/var/lib/docker) divide o boot volume de 50GB com o
+      # containerd do kubelet, mas o garbage collector do kubelet so enxerga o
+      # containerd: imagens, cache de build e builders buildx orfaos (execucoes
+      # canceladas nao passam pelo post-step de cleanup) acumulam ate o kubelet
+      # marcar o no com node.kubernetes.io/disk-pressure e despejar os pods --
+      # que entao nao cabem nos outros workers ("Insufficient cpu").
+      # Roda antes de qualquer build; nunca derruba o workflow (continue-on-error).
+      # So remove o que tem mais de 24h/72h, para nao tocar em build de outro repo
+      # (chirpstack etc.) que esteja rodando no mesmo host.
+      - name: Limpeza de disco do runner
+        continue-on-error: true
+        run: |
+          set +e
+          echo "== Disco ANTES"; df -h / ; docker system df
+
+          # 1) Builders buildx orfaos (containers buildx_buildkit_*) com mais de 24h
+          LIMITE=$(date -d '24 hours ago' +%s)
+          for ID in $(docker ps -aq --filter "name=buildx_buildkit_"); do
+            # O builder persistente do workflow (gitops-*) guarda o cache: nunca e orfao.
+            case "$(docker inspect -f '{{.Name}}' "$ID")" in */buildx_buildkit_gitops-*) continue ;; esac
+            CRIADO=$(date -d "$(docker inspect -f '{{.Created}}' "$ID")" +%s 2>/dev/null || echo 0)
+            if [ "$CRIADO" -gt 0 ] && [ "$CRIADO" -lt "$LIMITE" ]; then
+              echo "Removendo builder orfao: $(docker inspect -f '{{.Name}}' "$ID")"
+              docker rm -f "$ID"
+            fi
+          done
+          # Volumes de estado desses builders que ficaram sem dono
+          docker volume ls -q --filter dangling=true | grep '^buildx_buildkit_' | xargs -r docker volume rm
+
+          # 2) Docker do runner: containers parados, imagens e cache com mais de 72h
+          docker container prune -f --filter "until=24h"
+          docker image prune -af --filter "until=72h"
+          docker builder prune -af --filter "until=72h"
+
+          # 3) containerd do kubelet: imagens sem nenhum container usando
+          #    (tags :latest antigas que o imagePullPolicy: Always deixa para tras)
+          sudo -n crictl rmi --prune 2>/dev/null || echo "crictl indisponivel sem senha -- pulando"
+
+          # 4) Logs do systemd
+          sudo -n journalctl --vacuum-size=500M 2>/dev/null || true
+
+          echo "== Disco DEPOIS"; df -h / ; docker system df
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Filtrar paths alterados
+        uses: dorny/paths-filter@v4
+        id: filter
+        # Run workflow: quem decide e o input `target` (passo "Decidir" abaixo).
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          # GitOps: cada kustomization.yaml (newTag) fica fora do seu filtro, como em
+          # on.push.paths. Com padroes negados o quantificador precisa ser 'every' (o
+          # arquivo tem de casar com TODOS os padroes do filtro) -- por isso os caminhos
+          # positivos ficam num UNICO padrao com chaves e a exclusao vem a seguir. Com
+          # 'some', o "!..." casaria com qualquer outro arquivo e ligaria todos os jobs.
+          predicate-quantifier: 'every'
+          filters: |
+            app_adailsilva_site_frontend:
+              - '04.homepage/app_adailsilva_site_frontend/**'
+              - '!04.homepage/app_adailsilva_site_frontend/kubernetes/kustomization.yaml'
+            metrics_server:
+              - '{01.metrics_server/kubernetes/**,01.metrics_server/.force-deploy,gitops/apps/plataforma-metrics-server.yaml}'
+            portainer:
+              - '{03.portainer_ce/kubernetes/**,03.portainer_ce/.force-deploy,gitops/apps/plataforma-portainer.yaml}'
+            udp_health_check:
+              - '{02.udp_health_check-nlb_oci/{Dockerfile,UdpHealthCheckServer.java,.force-deploy,kubernetes/**},gitops/apps/plataforma-udp-health-check.yaml}'
+              - '!02.udp_health_check-nlb_oci/kubernetes/kustomization.yaml'
+
+      # Papel na plataforma do cluster: o repositorio 01 e o DONO (builda a imagem UDP e
+      # grava o newTag); nos demais as pastas 01/02 sao copias (so Sync no ArgoCD + verificacao).
+      - name: Papel desta execução na plataforma (dono x cópia)
+        id: papel
+        run: |
+          if [ "${GITHUB_REPOSITORY}" = "${DONO_PLATAFORMA}" ]; then
+            echo "dono=true" >> $GITHUB_OUTPUT
+            echo ">> ${GITHUB_REPOSITORY} e o DONO da plataforma: build + GitOps + verificacao."
+          else
+            echo "dono=false" >> $GITHUB_OUTPUT
+            echo ">> ${GITHUB_REPOSITORY} tem COPIA da plataforma: Sync no ArgoCD + verificacao (sem build)."
+          fi
+
+      # Decisao final (unica fonte dos outputs). Push: paths-filter. Run workflow: input
+      # `target` (todos/ambos = tudo, na ordem homepage -> plataforma -> sistemas).
+      - name: Decidir o que roda
+        id: decisao
+        env:
+          EVENTO: ${{ github.event_name }}
+          TARGET: ${{ github.event.inputs.target }}
+          F_app_adailsilva_site_frontend: ${{ steps.filter.outputs.app_adailsilva_site_frontend }}
+          F_metrics_server: ${{ steps.filter.outputs.metrics_server }}
+          F_portainer: ${{ steps.filter.outputs.portainer }}
+          F_udp_health_check: ${{ steps.filter.outputs.udp_health_check }}
+        run: |
+          set -euo pipefail
+          # <output>  <valores de target (Run workflow) que ligam o output>
+          MAPA='
+            app_adailsilva_site_frontend  app-adailsilva-site-frontend
+            metrics_server                metrics-server plataforma
+            portainer                     portainer plataforma
+            udp_health_check              udp-health-check plataforma
+          '
+          TODOS=false; VALIDO=false
+          case "$TARGET" in todos|ambos|"") TODOS=true; VALIDO=true ;; esac
+          RESUMO=""; ALGUM=false
+          while read -r O ALVOS; do
+            [ -n "$O" ] || continue
+            if [ "$EVENTO" = "workflow_dispatch" ]; then
+              V=$TODOS
+              for A in $ALVOS; do [ "$TARGET" = "$A" ] && V=true && VALIDO=true; done
+            else
+              F="F_$O"; V="${!F:-false}"
+            fi
+            echo "$O=$V" >> $GITHUB_OUTPUT
+            RESUMO+="| \`$O\` | $([ "$V" = true ] && echo '✅ sim' || echo '— não') |"$'\n'
+            echo ">> $O=$V"
+            [ "$V" = true ] && ALGUM=true || true
+          done <<< "$MAPA"
+          # Alguma etapa vai rodar? Sem nada a fazer, nao ha o que aprovar.
+          echo "algum=$ALGUM" >> $GITHUB_OUTPUT
+          if [ "$EVENTO" = "workflow_dispatch" ] && ! $VALIDO; then
+            echo "::error::target '$TARGET' invalido. Use todos/ambos ou um de: $(awk 'NF{for(i=2;i<=NF;i++)print $i}' <<< "$MAPA" | sort -u | tr '\n' ' ')"
+            exit 1
+          fi
+          {
+            echo "### O que roda nesta execução"
+            echo ""
+            echo "Ordem: **plataforma em paralelo (metrics-server, UDP health check, Portainer e site) → demais sistemas**"
+            echo ""
+            echo "| Output | Roda? |"
+            echo "|---|---|"
+            printf '%s' "$RESUMO"
+            echo ""
+            echo "_Evento: ${EVENTO}${TARGET:+ · target=${TARGET}}_"
+          } >> $GITHUB_STEP_SUMMARY
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB: APROVAÇÃO DO DEPLOY – uma aprovação por execução
+# Roda logo depois do detect (só se alguma etapa for rodar) e segura TODAS as
+# etapas seguintes: plataforma em paralelo (metrics-server, UDP, Portainer e site) → demais sistemas.
+# Repositório público: aprovação nativa do GitHub (environment `producao` com revisor
+# obrigatório). Aprove em Actions → execução → Review deployments → producao.
+# Rejeitar (ou cancelar a execução) impede todo o deploy desta execução.
+# ─────────────────────────────────────────────────────────────────────────────
+  aprovacao:
+    name: Aprovação do deploy
+    needs: detect
+    if: needs.detect.outputs.algum == 'true'
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 5
+    environment: producao
+    steps:
+      - name: Deploy aprovado
+        run: |
+          echo ">> Aprovado (environment producao). Seguindo: plataforma (em paralelo) → sistemas."
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB: ADAIL SILVA - SITE – FRONTEND (Angular / Avalon 21 + Nginx) – k8s.adailsilva.com.br
+# Site institucional do Adail Silva — Da Sua Ideia ao Kubernetes.
+# Disparado quando o job detect sinaliza app_adailsilva_site_frontend=true
+# Fluxo: build -> OCIR -> infra base -> newTag no GitOps (ArgoCD sincroniza o Deployment).
+# ─────────────────────────────────────────────────────────────────────────────
+  app_adailsilva_site_frontend:
+    name: Adail Silva - Site – Frontend (Angular)
+    #runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 45
+    needs: [detect, aprovacao]
+    if: |
+      needs.aprovacao.result == 'success' &&
+      needs.detect.outputs.app_adailsilva_site_frontend == 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      # ─── VERSIONAMENTO ──────────────────────────────────────────────────────
+      - name: Calcular próxima versão (app-adailsilva-site-frontend)
+        id: version
+        run: |
+          PREFIX="app-adailsilva-site-frontend"
+          LATEST=$(git tag --list "${PREFIX}-[0-9]*.[0-9]*" | sort -V | tail -1)
+
+          if [ -z "$LATEST" ]; then
+            LATEST="${PREFIX}-0.0"
+          fi
+
+          # Nunca voltar atras do newTag em uso no GitOps (as tags git se perdem quando o
+          # repositorio e recriado; reusar uma tag 0.x ja existente no OCIR deixa os nos com
+          # a imagem antiga em cache -- imagePullPolicy: IfNotPresent).
+          EM_USO=$(grep -rhE -A4 --include=kustomization.yaml "/${PREFIX}(-[0-9]+)?_platform" . 2>/dev/null \
+            | grep -oE '^[[:space:]]*newTag:[[:space:]]*"?[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          if [ -n "$EM_USO" ] && [ "$(printf '%s\n%s\n' "$EM_USO" "${LATEST#${PREFIX}-}" | sort -V | tail -1)" != "${LATEST#${PREFIX}-}" ]; then
+            echo ">> newTag em uso ($EM_USO) maior que a ultima tag git (${LATEST#${PREFIX}-}): partindo dele."
+            LATEST="${PREFIX}-${EM_USO}"
+          fi
+
+          NUMS=${LATEST#${PREFIX}-}
+          MAJOR=$(echo "$NUMS" | cut -d. -f1)
+          MINOR=$(echo "$NUMS" | cut -d. -f2)
+
+          if [ "${{ github.event.inputs.version_type }}" == "major" ]; then
+            NEW_VERSION="$((MAJOR + 1)).0"
+          else
+            NEW_VERSION="$MAJOR.$((MINOR + 1))"
+          fi
+
+          FULL_TAG="${PREFIX}-${NEW_VERSION}"
+          echo "Nova versão: $FULL_TAG"
+          echo "VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "FULL_TAG=$FULL_TAG"  >> $GITHUB_OUTPUT
+
+      - name: Criar tag Git (app-adailsilva-site-frontend)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag ${{ steps.version.outputs.FULL_TAG }}
+          git push origin ${{ steps.version.outputs.FULL_TAG }}
+      # ────────────────────────────────────────────────────────────────────────
+
+        # - name: Set up QEMU
+        # uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        id: buildx
+        # Builder persistente por repositorio: o cache do BuildKit (RUN --mount=type=cache
+        # das dependencias Maven/npm) sobrevive entre as execucoes. Com o builder
+        # descartavel da setup-buildx-action, cada build baixava tudo de novo.
+        run: |
+          NOME="gitops-${GITHUB_REPOSITORY#*/}"
+          docker buildx inspect "$NOME" >/dev/null 2>&1 \
+            || docker buildx create --name "$NOME" --driver docker-container >/dev/null
+          docker buildx inspect --bootstrap "$NOME" >/dev/null
+          # Teto do cache: o disco do runner e dividido com o containerd do kubelet.
+          docker buildx prune --builder "$NOME" -f --max-used-space 3gb >/dev/null 2>&1 || true
+          echo "name=$NOME" >> "$GITHUB_OUTPUT"
+          echo "platforms=$(docker buildx inspect "$NOME" | awk -F': *' '/^Platforms:/{print $2; exit}')" >> "$GITHUB_OUTPUT"
+
+      - name: Install OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_CONFIG }}"   > ~/.oci/config
+          echo "${{ secrets.OCI_KEY_FILE }}" > ~/.oci/key.pem
+
+          # Corrige o path do key_file para o home real do runner
+          sed -i "s|key_file=.*|key_file=$HOME/.oci/key.pem|g" ~/.oci/config
+
+          if [ -f "/home/ubuntu/bin/oci" ]; then
+            echo "OCI CLI já instalado: $(/home/ubuntu/bin/oci --version)"
+          else
+            echo "OCI CLI não encontrado, instalando..."
+            # Remove diretório residual que bloqueia o instalador
+            rm -rf /home/ubuntu/lib/oracle-cli
+            curl -L -O https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+            chmod +x install.sh
+            ./install.sh --accept-all-defaults
+          fi
+
+          # echo "/home/runner/bin" >> $GITHUB_PATH
+          echo "/home/ubuntu/bin" >> $GITHUB_PATH
+          /home/ubuntu/bin/oci setup repair-file-permissions --file ~/.oci/config
+          /home/ubuntu/bin/oci setup repair-file-permissions --file ~/.oci/key.pem
+
+      - name: Install kubectl
+        run: |
+          mkdir -p /tmp/.kube
+
+          if ! command -v kubectl &> /dev/null; then
+            echo "kubectl não encontrado, instalando..."
+            curl -L "https://dl.k8s.io/release/v1.31.4/bin/linux/arm64/kubectl" -o /tmp/kubectl
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          else
+            echo "kubectl já instalado: $(kubectl version --client 2>/dev/null | head -1)"
+          fi
+
+          echo "${{ secrets.KUBECONFIG }}" > /tmp/.kube/config
+          echo "KUBECONFIG=/tmp/.kube/config" >> $GITHUB_ENV
+
+      # ─── NAMESPACE ─────────────────────────────────────────────
+      # Garante o namespace ANTES de qualquer comando que dependa dele. Se nao
+      # existir (ex.: excluido manualmente), aplica o 01.create__Namespace.yaml;
+      # se estiver em Terminating, espera a exclusao terminar e recria. Os
+      # applies do 01 mais abaixo continuam (sao idempotentes).
+      - name: Garantir namespace (cria se não existir)
+        env:
+          NS_YAML: 04.homepage/app_adailsilva_site_frontend/kubernetes/01.create__Namespace.yaml
+        run: |
+          set -euo pipefail
+          NS=$(kubectl create --dry-run=client -f "$NS_YAML" -o jsonpath='{.metadata.name}')
+          fase() { kubectl get namespace "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || true; }
+          F=$(fase); echo ">> Namespace '$NS': ${F:-inexistente}"
+
+          # Terminating (exclusao anterior ainda em andamento): espera ate 300s.
+          for _ in $(seq 1 60); do
+            [ "$(fase)" = "Terminating" ] || break
+            echo ">> '$NS' em Terminating -- aguardando a exclusao terminar..."
+            sleep 5
+          done
+          if [ "$(fase)" = "Terminating" ]; then
+            echo ">> ERRO: '$NS' preso em Terminating ha mais de 300s. Condicoes:"
+            kubectl get namespace "$NS" -o jsonpath='{range .status.conditions[*]}  {.type}: {.message}{"\n"}{end}' || true
+            echo ">> Para liberar: kubectl get namespace $NS -o json | jq '.spec.finalizers = []' | kubectl replace --raw \"/api/v1/namespaces/$NS/finalize\" -f -"
+            exit 1
+          fi
+
+          # Inexistente -> cria; Active -> reaplica (idempotente).
+          [ -z "$(fase)" ] && echo ">> Criando namespace '$NS' a partir de $NS_YAML"
+          kubectl apply --server-side -f "$NS_YAML"
+
+          # So segue com o namespace Active e a ServiceAccount default criada.
+          for _ in $(seq 1 30); do
+            if [ "$(fase)" = "Active" ] && kubectl get serviceaccount default -n "$NS" &>/dev/null; then
+              echo ">> Namespace '$NS' pronto."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo ">> ERRO: namespace '$NS' nao ficou pronto em 60s."
+          exit 1
+
+      - name: Pods em execução (antes do deploy)
+        run: kubectl get pods -n adailsilva-site || echo "Namespace ainda não existe"
+
+      # ─── REPOSITORIO OCIR ──────────────────────────────────────
+      # O Terraform (oci_artifacts_container_repository) e a fonte oficial; este passo so
+      # cobre o primeiro deploy antes do "terraform apply": se o repositorio nao existir,
+      # cria no MESMO compartment do udp-health-check-server-1700 (presente nos 5
+      # repositorios), privado. Depois rode oci_artifacts_container_repository/
+      # import_existing_repositories.sh para trazer o repositorio para o state.
+      - name: Garantir repositório OCIR (app-adailsilva-site-frontend)
+        env:
+          REPO: app-adailsilva-site-frontend_platform_linux-arm64
+          REF:  udp-health-check-server-1700_platform_linux-arm64
+        run: |
+          set -euo pipefail
+          TENANCY=$(sed -n 's/^tenancy[[:space:]]*=[[:space:]]*//p' ~/.oci/config | head -1)
+
+          EXISTE=$(oci artifacts container repository list --compartment-id "$TENANCY" \
+            --compartment-id-in-subtree true --display-name "$REPO" --all \
+            --query 'length(data.items)' --raw-output 2>/dev/null || echo 0)
+          if [ "${EXISTE:-0}" != "0" ]; then
+            echo ">> Repositorio OCIR '$REPO' ja existe."
+            exit 0
+          fi
+
+          COMP=$(oci artifacts container repository list --compartment-id "$TENANCY" \
+            --compartment-id-in-subtree true --display-name "$REF" --all \
+            --query 'data.items[0]."compartment-id"' --raw-output)
+          if [ -z "$COMP" ] || [ "$COMP" = "null" ]; then
+            echo ">> ERRO: nao achei o repositorio de referencia '$REF' para descobrir o compartment."
+            exit 1
+          fi
+
+          echo ">> Criando repositorio OCIR '$REPO' (privado) no compartment do '$REF'..."
+          oci artifacts container repository create --compartment-id "$COMP" \
+            --display-name "$REPO" --is-public false --is-immutable false >/dev/null
+          echo ">> Criado. Lembrete: rode oci_artifacts_container_repository/import_existing_repositories.sh."
+
+      - name: Login no Docker Registry (OCI)
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ secrets.OCI_REGISTRY_URL }}
+          username: ${{ secrets.OCI_REGISTRY_USERNAME }}
+          password: ${{ secrets.OCI_REGISTRY_PASSWORD }}
+
+      - name: Available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+
+      # Dockerfile multi-stage, sem build-args. Repositorio OCIR app-adailsilva-site-frontend_platform_linux-arm64
+      # (Terraform; o passo "Garantir repositório OCIR" cria se ainda nao existir).
+      - name: Build & Push – Adail Silva - Site – Frontend
+        run: |
+          # Plataformas disponíveis: linux/amd64, linux/arm64
+          docker buildx build \
+            --builder ${{ steps.buildx.outputs.name }} \
+            --push \
+            --provenance=false --sbom=false \
+            --platform linux/arm64 \
+            --cache-from type=registry,ref=${{ secrets.OCI_REGISTRY_URL }}/${{ secrets.OCI_REGISTRY_OBJECT_STORAGE_NAMESPACE }}/app-adailsilva-site-frontend_platform_linux-arm64:buildcache \
+            --cache-to   type=registry,ref=${{ secrets.OCI_REGISTRY_URL }}/${{ secrets.OCI_REGISTRY_OBJECT_STORAGE_NAMESPACE }}/app-adailsilva-site-frontend_platform_linux-arm64:buildcache,mode=max \
+            -f 04.homepage/app_adailsilva_site_frontend/Dockerfile \
+            -t ${{ secrets.OCI_REGISTRY_URL }}/${{ secrets.OCI_REGISTRY_OBJECT_STORAGE_NAMESPACE }}/app-adailsilva-site-frontend_platform_linux-arm64:${{ steps.version.outputs.VERSION }} \
+            -t ${{ secrets.OCI_REGISTRY_URL }}/${{ secrets.OCI_REGISTRY_OBJECT_STORAGE_NAMESPACE }}/app-adailsilva-site-frontend_platform_linux-arm64:latest \
+            04.homepage/app_adailsilva_site_frontend
+
+      # ─── MANIFESTOS ─────────────────────────────────────────────────────────
+      #   02  Deployment     (NAO entra aqui: quem aplica e o ArgoCD)
+      #   01.create__Namespace.yaml
+      #   03.app-adailsilva-site-frontend__Service.yaml
+      #   06.app-adailsilva-site__Ingress.yaml
+      # ────────────────────────────────────────────────────────────────────────
+      - name: Aplicar infraestrutura base Adail Silva - Site – Frontend (Namespace, Service, Ingress)
+        run: |
+          set -euo pipefail
+
+          K8S=04.homepage/app_adailsilva_site_frontend/kubernetes
+
+          kubectl apply --server-side -f "$K8S/01.create__Namespace.yaml"
+
+          kubectl apply --server-side -f "$K8S/03.app-adailsilva-site-frontend__Service.yaml"
+
+          kubectl apply --server-side -f "$K8S/06.app-adailsilva-site__Ingress.yaml"
+      - name: Criar/atualizar imagePullSecret do OCI Registry (adailsilva-site)
+        run: |
+          kubectl create secret docker-registry oci-registry-secret \
+            --docker-server=${{ secrets.OCI_REGISTRY_URL }} \
+            --docker-username='${{ secrets.OCI_REGISTRY_USERNAME }}' \
+            --docker-password='${{ secrets.OCI_REGISTRY_PASSWORD }}' \
+            --docker-email='${{ secrets.OCI_REGISTRY_EMAIL }}' \
+            --namespace=adailsilva-site \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # O newTag e alterado num WORKTREE separado, criado a partir de origin/master.
+      # Assim o working tree do build fica intocado e cada tentativa parte sempre do
+      # estado remoto mais novo -- nao ha rebase, portanto nao ha conflito possivel.
+      - name: Fixar versão no GitOps (ArgoCD sincroniza)
+        env:
+          KUST: 04.homepage/app_adailsilva_site_frontend/kubernetes/kustomization.yaml
+          COMP: app-adailsilva-site-frontend
+          VER:  ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          git config user.email "github-actions@github.com"
+          git config user.name  "github-actions[bot]"
+
+          WT="$(mktemp -d)"
+          trap 'git worktree remove --force "$WT" 2>/dev/null || true; git worktree prune || true' EXIT
+
+          for i in $(seq 1 5); do
+            git fetch origin master
+
+            git worktree remove --force "$WT" 2>/dev/null || true
+            git worktree prune
+            git worktree add --detach "$WT" FETCH_HEAD
+
+            # Modulo CONGELADO (linha "# adailsilva-release-congelado: <motivo>" na kustomization):
+            # a imagem desta versao ja foi publicada no OCIR e a tag Git criada, mas o newTag
+            # NAO e trocado. Remova a linha para voltar ao deploy automatico a cada build.
+            if grep -q '^# adailsilva-release-congelado:' "$WT/$KUST"; then
+              echo ">> ${COMP} esta CONGELADO -- versao ${VER} publicada, mas NAO implantada."
+              grep '^# adailsilva-release-congelado:' "$WT/$KUST" | sed 's/^# adailsilva-release-congelado:/>>   congelado por:/'
+              exit 0
+            fi
+
+            sed -i -E "s|^([[:space:]]*newTag:).*|\1 \"${VER}\"|" "$WT/$KUST"
+            git -C "$WT" add "$KUST"
+
+            # Pergunta feita ao index: so "nada a commitar" sai com sucesso.
+            if git -C "$WT" diff --cached --quiet; then
+              echo ">> newTag de ${COMP} ja esta em ${VER} -- nada a commitar."
+              exit 0
+            fi
+
+            git -C "$WT" commit -m "deploy: ${COMP} ${VER} [skip ci]"
+
+            # HEAD:master nao depende do nome do branch local.
+            if git -C "$WT" push origin HEAD:master; then
+              echo ">> GitOps atualizado: ${COMP} -> ${VER} (tentativa ${i})."
+              exit 0
+            fi
+
+            # Espera ALEATORIA: com sleep fixo, duas execucoes concorrentes voltam a
+            # colidir no mesmo instante, tentativa apos tentativa.
+            ESPERA=$(( RANDOM % 5 + 2 ))
+            echo ">> push perdeu a corrida (tentativa ${i}); refazendo sobre o remoto em ${ESPERA}s..."
+            sleep "${ESPERA}"
+          done
+
+          echo ">> falha ao dar push no GitOps apos 5 tentativas"
+          exit 1
+
+      - name: Detectar ArgoCD (Application adailsilva-site-frontend)
+        if: env.CONGELADO != 'true'
+        id: argocd
+        env:
+          APP: adailsilva-site-frontend
+        run: |
+          set -uo pipefail
+          if kubectl get crd applications.argoproj.io &>/dev/null \
+             && kubectl get applications.argoproj.io "$APP" --namespace argocd &>/dev/null; then
+            AUTO=$(kubectl get applications.argoproj.io "$APP" --namespace argocd \
+              -o jsonpath='{.spec.syncPolicy.automated}' 2>/dev/null || true)
+            if [ -z "$AUTO" ]; then
+              echo "::warning::Application argocd/$APP com sync automatico desligado -- o newTag foi gravado no GitOps e sera aplicado quando o sync for religado."
+              echo "modo=manual" >> "$GITHUB_OUTPUT"
+            else
+              echo ">> Application argocd/$APP encontrada: o ArgoCD aplica o Deployment."
+              echo "modo=argocd" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::ArgoCD/Application argocd/$APP ausente -- deploy direto com kubectl apply -k (ver gitops/bootstrap/00-argocd-install.md)."
+            echo "modo=direto" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Aguardar ArgoCD aplicar Adail Silva - Site – Frontend
+        if: steps.argocd.outputs.modo == 'argocd'
+        env:
+          APP: adailsilva-site-frontend
+          NAMESPACE: adailsilva-site
+          DEPLOY: app-adailsilva-site-frontend-deployment
+          KUST: 04.homepage/app_adailsilva_site_frontend/kubernetes/kustomization.yaml
+          VER: ${{ steps.version.outputs.VERSION }}
+          ESPERA_SYNC: "300"
+          ESPERA_ROLLOUT: 180s
+        run: |
+          set -uo pipefail
+
+          diagnostico() {
+            echo "===================================================================="
+            echo ">> DIAGNOSTICO -- Application argocd/$APP e Deployment $NAMESPACE/$DEPLOY"
+            echo "===================================================================="
+            kubectl get applications.argoproj.io "$APP" --namespace argocd -o jsonpath='Sync: {.status.sync.status} (revisao {.status.sync.revision}){"\n"}Saude: {.status.health.status}{"\n"}Operacao: {.status.operationState.phase} -- {.status.operationState.message}{"\n"}' || true
+            echo ">> --- Condicoes da Application ---"
+            kubectl get applications.argoproj.io "$APP" --namespace argocd -o jsonpath='{range .status.conditions[*]}  {.type}: {.message}{"\n"}{end}' || true
+            echo ">> --- Recursos da Application ---"
+            kubectl get applications.argoproj.io "$APP" --namespace argocd -o jsonpath='{range .status.resources[*]}  {.kind}/{.name}: {.status} {.health.status} {.health.message}{"\n"}{end}' || true
+            echo ">> --- Deployment ---"
+            kubectl describe deployment "$DEPLOY" --namespace "$NAMESPACE" | tail -n 25 || true
+            echo ">> --- Pods ---"
+            kubectl get pods --namespace "$NAMESPACE" -l "app=$DEPLOY" -o wide || true
+            for POD in $(kubectl get pods --namespace "$NAMESPACE" -l "app=$DEPLOY" -o name 2>/dev/null); do
+              echo ">> ===== $POD ====="
+              kubectl describe --namespace "$NAMESPACE" "$POD" | sed -n '/^Events:/,$p' || true
+              kubectl logs --namespace "$NAMESPACE" "$POD" --all-containers=true --prefix=true --tail=80 --timestamps || true
+            done
+            echo ">> --- Eventos recentes ---"
+            kubectl get events --namespace "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
+            # Pod Pending com "Insufficient cpu/memory": o scheduler soma os REQUESTS
+            # (nao o uso real). Mostra quanto cada no ja tem reservado e quem reserva.
+            if kubectl get pods --namespace "$NAMESPACE" -l "app=$DEPLOY" --field-selector=status.phase=Pending -o name 2>/dev/null | grep -q .; then
+              echo ">> --- Capacidade dos nos (requests reservados) ---"
+              for NO in $(kubectl get nodes -o name 2>/dev/null); do
+                echo ">> $NO"
+                kubectl describe "$NO" | sed -n '/^Allocated resources:/,/^Events:/p' | sed -n '1,8p' || true
+              done
+              echo ">> --- Requests de CPU/memoria por pod, agrupados por no ---"
+              kubectl get pods --all-namespaces --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+                -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,NO:.spec.nodeName,CPU_REQ:.spec.containers[*].resources.requests.cpu,MEM_REQ:.spec.containers[*].resources.requests.memory' \
+                --sort-by=.spec.nodeName 2>/dev/null || true
+            fi
+          }
+
+          NEW_NAME=$(sed -n -E 's|^[[:space:]]*newName:[[:space:]]*"?([^"[:space:]]+)"?.*|\1|p' "$KUST" | head -n 1)
+          ALVO="${NEW_NAME}:${VER}"
+
+          # Refresh imediato: sem ele o ArgoCD so percebe o commit no proximo polling (~3 min).
+          kubectl annotate applications.argoproj.io "$APP" --namespace argocd \
+            argocd.argoproj.io/refresh=normal --overwrite >/dev/null \
+            || echo ">> aviso: nao foi possivel pedir refresh -- aguardando o polling do ArgoCD."
+
+          echo ">> Aguardando o ArgoCD aplicar $DEPLOY ${VER} (ate ${ESPERA_SYNC}s)..."
+          FIM=$((SECONDS + ESPERA_SYNC))
+          while :; do
+            ATUAL=$(kubectl get deployment "$DEPLOY" --namespace "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+            [ "$ATUAL" = "$ALVO" ] && break
+            if [ "$SECONDS" -ge "$FIM" ]; then
+              echo ">> ERRO: o ArgoCD nao aplicou a versao ${VER} em ${ESPERA_SYNC}s (imagem atual: ${ATUAL:-nenhuma})."
+              diagnostico; exit 1
+            fi
+            sleep 10
+          done
+          echo ">> Deployment com a imagem da versao ${VER}. Aguardando o rollout..."
+
+          kubectl rollout status "deployment/$DEPLOY" --namespace "$NAMESPACE" --timeout="$ESPERA_ROLLOUT" \
+            || { echo ">> ERRO: rollout de $DEPLOY nao concluiu em $ESPERA_ROLLOUT."; diagnostico; exit 1; }
+
+      # Fallback do PRIMEIRO deploy (ArgoCD ainda nao instalado neste cluster): aplica a
+      # MESMA renderizacao que o ArgoCD faria (kubectl apply -k: newName real, newTag X.Y,
+      # imagePullPolicy IfNotPresent). O newTag e trocado so na copia local -- o commit ja
+      # foi feito acima. Quando o ArgoCD for instalado, ele adota este Deployment.
+      - name: Deploy direto Adail Silva - Site – Frontend (sem ArgoCD)
+        if: steps.argocd.outputs.modo == 'direto'
+        env:
+          NAMESPACE: adailsilva-site
+          DEPLOY: app-adailsilva-site-frontend-deployment
+          KUST_DIR: 04.homepage/app_adailsilva_site_frontend/kubernetes
+          VER: ${{ steps.version.outputs.VERSION }}
+          ESPERA_ROLLOUT: 180s
+        run: |
+          set -euo pipefail
+
+          diagnostico() {
+            echo "===================================================================="
+            echo ">> DIAGNOSTICO -- Deployment $NAMESPACE/$DEPLOY"
+            echo "===================================================================="
+            kubectl describe deployment "$DEPLOY" --namespace "$NAMESPACE" | tail -n 25 || true
+            kubectl get pods --namespace "$NAMESPACE" -l "app=$DEPLOY" -o wide || true
+            for POD in $(kubectl get pods --namespace "$NAMESPACE" -l "app=$DEPLOY" -o name 2>/dev/null); do
+              echo ">> ===== $POD ====="
+              kubectl describe --namespace "$NAMESPACE" "$POD" | sed -n '/^Events:/,$p' || true
+              kubectl logs --namespace "$NAMESPACE" "$POD" --all-containers=true --prefix=true --tail=80 --timestamps || true
+            done
+            kubectl get events --namespace "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
+            # Pod Pending com "Insufficient cpu/memory": o scheduler soma os REQUESTS
+            # (nao o uso real). Mostra quanto cada no ja tem reservado e quem reserva.
+            if kubectl get pods --namespace "$NAMESPACE" -l "app=$DEPLOY" --field-selector=status.phase=Pending -o name 2>/dev/null | grep -q .; then
+              echo ">> --- Capacidade dos nos (requests reservados) ---"
+              for NO in $(kubectl get nodes -o name 2>/dev/null); do
+                echo ">> $NO"
+                kubectl describe "$NO" | sed -n '/^Allocated resources:/,/^Events:/p' | sed -n '1,8p' || true
+              done
+              echo ">> --- Requests de CPU/memoria por pod, agrupados por no ---"
+              kubectl get pods --all-namespaces --field-selector=status.phase!=Succeeded,status.phase!=Failed \
+                -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,NO:.spec.nodeName,CPU_REQ:.spec.containers[*].resources.requests.cpu,MEM_REQ:.spec.containers[*].resources.requests.memory' \
+                --sort-by=.spec.nodeName 2>/dev/null || true
+            fi
+          }
+
+          sed -i -E "s|^([[:space:]]*newTag:).*|\1 \"${VER}\"|" "$KUST_DIR/kustomization.yaml"
+          # Renderiza ANTES de aplicar: erro de kustomization aparece aqui, sem tocar no cluster.
+          # (mktemp: ha dois runners por worker.)
+          RENDER="$(mktemp)"
+          trap 'rm -f "$RENDER"' EXIT
+          kubectl kustomize "$KUST_DIR" > "$RENDER"
+          grep -E 'image:' "$RENDER" || true
+          GEN_ANTES="$(kubectl get deployment "$DEPLOY" --namespace "$NAMESPACE" -o jsonpath='{.metadata.generation}' 2>/dev/null || echo 0)"
+          kubectl apply -f "$RENDER"
+          GEN_DEPOIS="$(kubectl get deployment "$DEPLOY" --namespace "$NAMESPACE" -o jsonpath='{.metadata.generation}' 2>/dev/null || echo 0)"
+
+          # Mesma tag reconstruida (ex.: 0.1 de novo): o apply nao muda o template,
+          # entao nao ha rollout novo -- o pod antigo continua em ImagePullBackOff e o
+          # Deployment fica preso em ProgressDeadlineExceeded. O restart cria pods novos
+          # (imagePullPolicy: Always puxa a imagem recem-publicada) e zera o prazo.
+          if [ "$GEN_ANTES" != "0" ] && [ "$GEN_ANTES" = "$GEN_DEPOIS" ]; then
+            echo ">> Template sem mudanca (mesma tag ${VER}): forcando rollout restart de $DEPLOY."
+            kubectl rollout restart "deployment/$DEPLOY" --namespace "$NAMESPACE"
+          fi
+
+          # Corrida: logo apos o apply/restart, a condicao Progressing ainda pode trazer o
+          # ProgressDeadlineExceeded da tentativa ANTERIOR, e o `rollout status` falha na hora
+          # sem esperar nada. Aguarda (ate 60s) o controller zerar o prazo antes de acompanhar.
+          for _ in $(seq 1 30); do
+            MOTIVO="$(kubectl get deployment "$DEPLOY" --namespace "$NAMESPACE" \
+              -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}' 2>/dev/null || true)"
+            [ "$MOTIVO" != "ProgressDeadlineExceeded" ] && break
+            sleep 2
+          done
+
+          kubectl rollout status "deployment/$DEPLOY" --namespace "$NAMESPACE" --timeout="$ESPERA_ROLLOUT" \
+            || { echo ">> ERRO: rollout de $DEPLOY nao concluiu em $ESPERA_ROLLOUT."; diagnostico; exit 1; }
+
+      # ─── LIMPEZA DE IMAGENS SEM TAG (app-adailsilva-site-frontend) ───────────
+      - name: Limpar imagens unknown do OCI Registry (app-adailsilva-site-frontend)
+        continue-on-error: true
+        env:
+          REPO: app-adailsilva-site-frontend_platform_linux-arm64
+        run: |
+          set -uo pipefail
+          TENANCY=$(sed -n 's/^tenancy[[:space:]]*=[[:space:]]*//p' ~/.oci/config | head -1)
+          COMP_ID=$(oci artifacts container repository list --compartment-id "$TENANCY" \
+            --compartment-id-in-subtree true --display-name "$REPO" --all \
+            --query 'data.items[0]."compartment-id"' --raw-output 2>/dev/null || true)
+          if [ -z "$COMP_ID" ] || [ "$COMP_ID" = "null" ]; then
+            echo ">> Repositorio OCIR '$REPO' nao encontrado -- nada a limpar."
+            exit 0
+          fi
+
+          IMAGE_IDS=$(oci artifacts container image list \
+            --compartment-id "$COMP_ID" \
+            --repository-name "$REPO" \
+            --lifecycle-state AVAILABLE \
+            --all \
+            --query 'data.items[*].{"id":id,"name":"display-name"}' \
+            --raw-output | \
+            jq -r '.[] | select(.name | test("unknown")) | .id')
+
+          if [ -z "$IMAGE_IDS" ]; then
+            echo "Nenhuma imagem unknown encontrada."
+          else
+            echo "Deletando imagens unknown..."
+            for IMAGE_ID in $IMAGE_IDS; do
+              echo "  → Deletando: $IMAGE_ID"
+              oci artifacts container image delete \
+                --image-id "$IMAGE_ID" \
+                --force
+            done
+            echo "Limpeza concluída."
+          fi
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB: METRICS SERVER (kube-system) – kubectl top / HPA
+# Imagem publica (registry.k8s.io), sem build. Mesmos 6 arquivos da Application
+# plataforma-metrics-server (00 Full, 01 Namespace e 05 duplicado ficam de fora).
+# ─────────────────────────────────────────────────────────────────────────────
+  plataforma_metrics_server:
+    name: Plataforma – Metrics Server
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 30
+    # Plataforma em paralelo: metrics-server, UDP health check, Portainer e site rodam juntos
+    # logo apos a aprovacao; os sistemas so sobem depois que os quatro terminam sem falha.
+    needs: [detect, aprovacao]
+    if: |
+      !cancelled() &&
+      needs.aprovacao.result == 'success' &&
+      needs.detect.outputs.metrics_server == 'true'
+    env:
+      DONO: ${{ needs.detect.outputs.dono }}
+      APP:  plataforma-metrics-server
+      K8S:  01.metrics_server/kubernetes
+      NS:   kube-system
+      ARQUIVOS: >-
+        02.metrics-server__ServiceAccount.yaml
+        03.metrics-server__ClusterRole.yaml
+        04.metrics-server__RoleBinding.yaml
+        06.metrics-server__Deployment.yaml
+        07.metrics-server__Service.yaml
+        08.metrics-server__ApiService.yaml
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install kubectl
+        run: |
+          mkdir -p /tmp/.kube
+
+          if ! command -v kubectl &> /dev/null; then
+            echo "kubectl não encontrado, instalando..."
+            curl -L "https://dl.k8s.io/release/v1.31.4/bin/linux/arm64/kubectl" -o /tmp/kubectl
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          else
+            echo "kubectl já instalado: $(kubectl version --client 2>/dev/null | head -1)"
+          fi
+
+          echo "${{ secrets.KUBECONFIG }}" > /tmp/.kube/config
+          echo "KUBECONFIG=/tmp/.kube/config" >> $GITHUB_ENV
+
+      - name: Validar manifestos (dry-run=server)
+        run: |
+          set -euo pipefail
+          for F in $ARQUIVOS; do
+            kubectl apply --server-side --dry-run=server -f "$K8S/$F" > /dev/null
+            echo ">> ok: $F"
+          done
+
+      - name: Estado atual (antes do deploy)
+        run: |
+          kubectl -n "$NS" get deployment metrics-server -o wide || echo "metrics-server ainda nao existe"
+          kubectl get apiservice v1beta1.metrics.k8s.io || true
+
+      # Quem aplica e SEMPRE o ArgoCD (Application plataforma-metrics-server, automatica,
+      # selfHeal). O pipeline pede refresh, espera Synced + Healthy (no dono: no commit
+      # desta execucao ou mais novo) e, se o auto-sync nao andar, solicita o Sync.
+      - name: Sync no ArgoCD (plataforma-metrics-server)
+        run: |
+          set -uo pipefail
+          A="kubectl -n argocd get application.argoproj.io $APP"
+
+          # Todo deploy passa pelo ArgoCD: sem a Application nao ha deploy (nada de kubectl apply direto).
+          if ! $A > /dev/null 2>&1; then
+            echo "::error::Application $APP nao existe no ArgoCD. Rode o bootstrap no repositorio ${DONO_PLATAFORMA}: bash gitops/bootstrap/01-aplicar-padrao-argocd.sh"
+            exit 1
+          fi
+
+          PODE_PATCH=false
+          [ "$(kubectl auth can-i patch applications.argoproj.io -n argocd)" = "yes" ] && PODE_PATCH=true
+          if $PODE_PATCH; then
+            kubectl -n argocd annotate application.argoproj.io "$APP" argocd.argoproj.io/refresh=normal --overwrite > /dev/null
+            echo ">> Refresh solicitado em $APP."
+          else
+            echo "::warning::O KUBECONFIG nao pode dar patch em applications.argoproj.io: aguardando o polling do ArgoCD (ate 3 min)."
+          fi
+
+          # So o dono exige o commit desta execucao (as copias nao mudam o que o ArgoCD aplica).
+          ALVO=""; [ "$DONO" = "true" ] && ALVO="$GITHUB_SHA"
+          SYNC_PEDIDO=false
+          for i in $(seq 1 120); do
+            REV=$($A -o jsonpath='{.status.sync.revision}' 2>/dev/null || true)
+            SYNC=$($A -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            SAUDE=$($A -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            NO_ALVO=true
+            if [ -n "$ALVO" ]; then
+              git cat-file -e "${REV}^{commit}" 2>/dev/null || git fetch origin master --quiet || true
+              git merge-base --is-ancestor "$ALVO" "$REV" 2>/dev/null || NO_ALVO=false
+            fi
+            if $NO_ALVO && [ "$SYNC" = "Synced" ] && [ "$SAUDE" = "Healthy" ]; then
+              echo ">> $APP: Synced + Healthy @ ${REV:0:7}"
+              echo "- ArgoCD \`$APP\`: **Synced + Healthy** @ \`${REV:0:7}\`" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+
+            # O auto-sync nao repete sozinho um sync que falhou na mesma revisao. Se apos
+            # ~60s continuar OutOfSync e sem operacao em andamento, pede o Sync (= botao Sync).
+            if [ "$i" -ge 12 ] && ! $SYNC_PEDIDO && $PODE_PATCH && [ "$SYNC" = "OutOfSync" ] \
+               && [ -z "$($A -o jsonpath='{.operation}' 2>/dev/null)" ]; then
+              PATCH=$(printf '{"operation":{"initiatedBy":{"username":"github-actions (%s)"},"info":[{"name":"Reason","value":"%s #%s (%s)"}],"sync":{"revision":"master","syncOptions":["ApplyOutOfSyncOnly=true","CreateNamespace=true"]}}}' \
+                "$GITHUB_ACTOR" "$GITHUB_WORKFLOW" "$GITHUB_RUN_NUMBER" "$GITHUB_REPOSITORY")
+              kubectl -n argocd patch application.argoproj.io "$APP" --type merge -p "$PATCH" > /dev/null && \
+                echo ">> $APP continuava OutOfSync -- Sync solicitado ao ArgoCD."
+              SYNC_PEDIDO=true
+            fi
+
+            echo ">> $APP: sync=${SYNC:-?} health=${SAUDE:-?} revisao=${REV:0:7} (alvo ${ALVO:0:7}) -- aguardando..."
+            sleep 5
+          done
+
+          echo "::error::$APP nao ficou Synced + Healthy em 10 min."
+          $A -o jsonpath='Operacao: {.status.operationState.phase} -- {.status.operationState.message}{"\n"}' || true
+          $A -o jsonpath='{range .status.resources[*]}  {.kind}/{.name}: {.status} {.health.status} {.health.message}{"\n"}{end}' || true
+          exit 1
+
+      - name: Verificar metrics-server (rollout, APIService e kubectl top)
+        run: |
+          set -uo pipefail
+          kubectl -n "$NS" rollout status deployment/metrics-server --timeout=300s || exit 1
+
+          for _ in $(seq 1 36); do
+            DISP=$(kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+            [ "$DISP" = "True" ] && break
+            echo ">> APIService v1beta1.metrics.k8s.io Available=${DISP:-?} -- aguardando..."
+            sleep 5
+          done
+          if [ "$DISP" != "True" ]; then
+            echo "::error::APIService v1beta1.metrics.k8s.io nao ficou Available."
+            kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.status.conditions[*].message}{"\n"}' || true
+            exit 1
+          fi
+
+          # As primeiras metricas levam ate ~1 min (--metric-resolution=15s).
+          for _ in $(seq 1 24); do
+            if TOP=$(kubectl top nodes 2>&1); then
+              echo "$TOP"
+              {
+                echo "### Plataforma – Metrics Server"
+                echo ""
+                echo "- Repositório: \`${GITHUB_REPOSITORY}\` (dono: **${DONO}**)"
+                echo "- APIService \`v1beta1.metrics.k8s.io\`: **Available**"
+                echo ""
+                echo '```'
+                echo "$TOP"
+                echo '```'
+              } >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+            echo ">> kubectl top nodes ainda sem metricas -- aguardando..."
+            sleep 5
+          done
+          echo "::error::kubectl top nodes nao retornou metricas em 2 min."
+          echo "$TOP"
+          exit 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB: UDP HEALTH CHECK DO NLB DA OCI (oci-devops) – DaemonSets 1700 e 1710
+# Um pod por worker em cada DaemonSet (hostNetwork + hostPort). O NLB da OCI manda
+# "PING" na UDP 1700/1710 de cada no e espera "PONG"; no sem resposta sai do backend set.
+# Dono: build das 2 imagens -> tag Git -> newTag (kustomization.yaml) -> ArgoCD.
+# Copia: Sync no ArgoCD e verificacao (sem build). Quem aplica e sempre o ArgoCD.
+# ─────────────────────────────────────────────────────────────────────────────
+  plataforma_udp_health_check:
+    name: Plataforma – UDP Health Check (NLB OCI)
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 45
+    # Plataforma em paralelo: roda logo apos a aprovacao, junto com metrics-server, Portainer e site.
+    needs: [detect, aprovacao]
+    if: |
+      !cancelled() &&
+      needs.aprovacao.result == 'success' &&
+      needs.detect.outputs.udp_health_check == 'true'
+    env:
+      DONO: ${{ needs.detect.outputs.dono }}
+      APP:  plataforma-udp-health-check
+      DIR:  02.udp_health_check-nlb_oci
+      K8S:  02.udp_health_check-nlb_oci/kubernetes
+      KUST: 02.udp_health_check-nlb_oci/kubernetes/kustomization.yaml
+      NS:   oci-devops
+      DS_1700: udp-app-with-healthcheck-1700-daemon-set
+      DS_1710: udp-app-with-healthcheck-1710-daemon-set
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      # ─── VERSIONAMENTO (só no dono) ─────────────────────────────────────────
+      # Uma versao para as duas imagens (mesmo codigo; so a porta muda via UDP_PORT).
+      - name: Calcular próxima versão (udp-health-check-server)
+        id: version
+        if: env.DONO == 'true'
+        run: |
+          PREFIX="udp-health-check-server"
+          LATEST=$(git tag --list "${PREFIX}-[0-9]*.[0-9]*" | sort -V | tail -1)
+          [ -z "$LATEST" ] && LATEST="${PREFIX}-0.0"
+
+          # Nunca voltar atras do newTag em uso no GitOps (as tags git se perdem quando o
+          # repositorio e recriado; reusar uma tag 0.x ja existente no OCIR deixa os nos com
+          # a imagem antiga em cache -- imagePullPolicy: IfNotPresent).
+          EM_USO=$(grep -rhE -A4 --include=kustomization.yaml "/${PREFIX}(-[0-9]+)?_platform" . 2>/dev/null \
+            | grep -oE '^[[:space:]]*newTag:[[:space:]]*"?[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          if [ -n "$EM_USO" ] && [ "$(printf '%s\n%s\n' "$EM_USO" "${LATEST#${PREFIX}-}" | sort -V | tail -1)" != "${LATEST#${PREFIX}-}" ]; then
+            echo ">> newTag em uso ($EM_USO) maior que a ultima tag git (${LATEST#${PREFIX}-}): partindo dele."
+            LATEST="${PREFIX}-${EM_USO}"
+          fi
+
+          NUMS=${LATEST#${PREFIX}-}
+          MAJOR=$(echo "$NUMS" | cut -d. -f1)
+          MINOR=$(echo "$NUMS" | cut -d. -f2)
+
+          if [ "${{ github.event.inputs.version_type }}" == "major" ]; then
+            NEW_VERSION="$((MAJOR + 1)).0"
+          else
+            NEW_VERSION="$MAJOR.$((MINOR + 1))"
+          fi
+
+          FULL_TAG="${PREFIX}-${NEW_VERSION}"
+          echo "Nova versão: $FULL_TAG"
+          echo "VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "FULL_TAG=$FULL_TAG"  >> $GITHUB_OUTPUT
+
+      - name: Criar tag Git (udp-health-check-server)
+        if: env.DONO == 'true'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag ${{ steps.version.outputs.FULL_TAG }}
+          git push origin ${{ steps.version.outputs.FULL_TAG }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        if: env.DONO == 'true'
+        # Builder persistente por repositorio: o cache do BuildKit (RUN --mount=type=cache
+        # das dependencias Maven/npm) sobrevive entre as execucoes. Com o builder
+        # descartavel da setup-buildx-action, cada build baixava tudo de novo.
+        run: |
+          NOME="gitops-${GITHUB_REPOSITORY#*/}"
+          docker buildx inspect "$NOME" >/dev/null 2>&1 \
+            || docker buildx create --name "$NOME" --driver docker-container >/dev/null
+          docker buildx inspect --bootstrap "$NOME" >/dev/null
+          # Teto do cache: o disco do runner e dividido com o containerd do kubelet.
+          docker buildx prune --builder "$NOME" -f --max-used-space 3gb >/dev/null 2>&1 || true
+          echo "name=$NOME" >> "$GITHUB_OUTPUT"
+          echo "platforms=$(docker buildx inspect "$NOME" | awk -F': *' '/^Platforms:/{print $2; exit}')" >> "$GITHUB_OUTPUT"
+
+      - name: Login no Docker Registry (OCI)
+        if: env.DONO == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ secrets.OCI_REGISTRY_URL }}
+          username: ${{ secrets.OCI_REGISTRY_USERNAME }}
+          password: ${{ secrets.OCI_REGISTRY_PASSWORD }}
+
+      # Mesma Dockerfile, porta gravada por --build-arg UDP_PORT (o manifesto ainda
+      # sobrescreve com a env UDP_PORT). Repositorios OCIR ja existentes (sao a
+      # referencia de compartment dos outros pipelines).
+      - name: Build & Push – UDP Health Check 1700 e 1710
+        if: env.DONO == 'true'
+        env:
+          REG: ${{ secrets.OCI_REGISTRY_URL }}/${{ secrets.OCI_REGISTRY_OBJECT_STORAGE_NAMESPACE }}
+          VER: ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          for PORTA in 1700 1710; do
+            IMG="$REG/udp-health-check-server-${PORTA}_platform_linux-arm64"
+            echo ">> Build $IMG:$VER (UDP_PORT=$PORTA)"
+            docker buildx build \
+              --builder ${{ steps.buildx.outputs.name }} \
+              --push \
+              --provenance=false --sbom=false \
+              --platform linux/arm64 \
+              --build-arg UDP_PORT=$PORTA \
+              --cache-from type=registry,ref=$IMG:buildcache \
+              --cache-to   type=registry,ref=$IMG:buildcache,mode=max \
+              -f "$DIR/Dockerfile" \
+              -t "$IMG:$VER" \
+              -t "$IMG:latest" \
+              "$DIR"
+          done
+
+      - name: Install kubectl
+        run: |
+          mkdir -p /tmp/.kube
+
+          if ! command -v kubectl &> /dev/null; then
+            echo "kubectl não encontrado, instalando..."
+            curl -L "https://dl.k8s.io/release/v1.31.4/bin/linux/arm64/kubectl" -o /tmp/kubectl
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          else
+            echo "kubectl já instalado: $(kubectl version --client 2>/dev/null | head -1)"
+          fi
+
+          echo "${{ secrets.KUBECONFIG }}" > /tmp/.kube/config
+          echo "KUBECONFIG=/tmp/.kube/config" >> $GITHUB_ENV
+
+      - name: Validar manifestos (kustomize + dry-run=server)
+        run: |
+          set -euo pipefail
+          kubectl kustomize "$K8S" > /tmp/udp-render.yaml
+          grep -E '^\s+image:' /tmp/udp-render.yaml
+          kubectl apply --server-side --dry-run=server -f "$K8S/01.create__Namespace.yaml" > /dev/null
+          if kubectl get namespace "$NS" > /dev/null 2>&1; then
+            kubectl apply --server-side --dry-run=server -f /tmp/udp-render.yaml > /dev/null
+          fi
+          echo ">> Manifestos validos."
+
+      # O ArgoCD so renderiza os 2 DaemonSets; o imagePullSecret nao pode ir para o Git.
+      # Namespace: so cria se faltar (a Application tambem tem CreateNamespace=true).
+      # Secret: o dono sempre atualiza; as copias so criam se faltar (mesmo secret nos 6).
+      - name: Garantir namespace e imagePullSecret (oci-devops)
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            [ "$(kubectl get namespace "$NS" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Terminating" ] || break
+            echo ">> '$NS' em Terminating -- aguardando..."; sleep 5
+          done
+          if ! kubectl get namespace "$NS" > /dev/null 2>&1; then
+            kubectl apply --server-side -f "$K8S/01.create__Namespace.yaml"
+          fi
+
+          if [ "$DONO" = "true" ] || ! kubectl -n "$NS" get secret oci-registry-secret > /dev/null 2>&1; then
+            kubectl create secret docker-registry oci-registry-secret \
+              --docker-server=${{ secrets.OCI_REGISTRY_URL }} \
+              --docker-username='${{ secrets.OCI_REGISTRY_USERNAME }}' \
+              --docker-password='${{ secrets.OCI_REGISTRY_PASSWORD }}' \
+              --docker-email='${{ secrets.OCI_REGISTRY_EMAIL }}' \
+              --namespace="$NS" \
+              --dry-run=client -o yaml | kubectl apply -f -
+          else
+            echo ">> oci-registry-secret ja existe em $NS (mantido pelo dono)."
+          fi
+
+      - name: Pods em execução (antes do deploy)
+        run: kubectl get daemonset,pods -n "$NS" -o wide || true
+
+      # Worktree separado a partir de origin/master (igual aos outros modulos): sem rebase,
+      # sem conflito. Linha "# plataforma-release-congelado: <motivo>" na kustomization
+      # congela o rollout (imagem publicada, newTag mantido).
+      - name: Fixar versão no GitOps (ArgoCD sincroniza)
+        id: gitops
+        if: env.DONO == 'true'
+        env:
+          COMP: udp-health-check-server
+          VER:  ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          git config user.email "github-actions@github.com"
+          git config user.name  "github-actions[bot]"
+
+          WT="$(mktemp -d)"
+          trap 'git worktree remove --force "$WT" 2>/dev/null || true; git worktree prune || true' EXIT
+
+          for i in $(seq 1 5); do
+            git fetch origin master
+
+            git worktree remove --force "$WT" 2>/dev/null || true
+            git worktree prune
+            git worktree add --detach "$WT" FETCH_HEAD
+
+            if grep -q '^# plataforma-release-congelado:' "$WT/$KUST"; then
+              echo ">> ${COMP} esta CONGELADO -- versao ${VER} publicada, mas NAO implantada."
+              grep '^# plataforma-release-congelado:' "$WT/$KUST" | sed 's/^# plataforma-release-congelado:/>>   congelado por:/'
+              echo "ALVO=$(git -C "$WT" rev-parse HEAD)" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            # As duas imagens (1700 e 1710) recebem a mesma versao.
+            sed -i -E "s|^([[:space:]]*newTag:).*|\1 \"${VER}\"|" "$WT/$KUST"
+            git -C "$WT" add "$KUST"
+
+            if git -C "$WT" diff --cached --quiet; then
+              echo ">> newTag de ${COMP} ja esta em ${VER} -- nada a commitar."
+              echo "ALVO=$(git -C "$WT" rev-parse HEAD)" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            git -C "$WT" commit -m "deploy: ${COMP} ${VER} [skip ci]"
+
+            if git -C "$WT" push origin HEAD:master; then
+              echo ">> GitOps atualizado: ${COMP} -> ${VER} (tentativa ${i})."
+              echo "ALVO=$(git -C "$WT" rev-parse HEAD)" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            ESPERA=$(( RANDOM % 5 + 2 ))
+            echo ">> push perdeu a corrida (tentativa ${i}); refazendo sobre o remoto em ${ESPERA}s..."
+            sleep "${ESPERA}"
+          done
+
+          echo ">> falha ao dar push no GitOps apos 5 tentativas"
+          exit 1
+
+      # Quem aplica e SEMPRE o ArgoCD (Application plataforma-udp-health-check). O dono
+      # espera o commit do newTag; as copias so esperam Synced + Healthy.
+      - name: Sync no ArgoCD (plataforma-udp-health-check)
+        env:
+          ALVO_GITOPS: ${{ steps.gitops.outputs.ALVO }}
+        run: |
+          set -uo pipefail
+          A="kubectl -n argocd get application.argoproj.io $APP"
+
+          # Todo deploy passa pelo ArgoCD: sem a Application nao ha deploy (nada de kubectl apply direto).
+          if ! $A > /dev/null 2>&1; then
+            echo "::error::Application $APP nao existe no ArgoCD. Rode o bootstrap no repositorio ${DONO_PLATAFORMA}: bash gitops/bootstrap/01-aplicar-padrao-argocd.sh"
+            exit 1
+          fi
+
+          PODE_PATCH=false
+          [ "$(kubectl auth can-i patch applications.argoproj.io -n argocd)" = "yes" ] && PODE_PATCH=true
+          if $PODE_PATCH; then
+            kubectl -n argocd annotate application.argoproj.io "$APP" argocd.argoproj.io/refresh=normal --overwrite > /dev/null
+            echo ">> Refresh solicitado em $APP."
+          else
+            echo "::warning::O KUBECONFIG nao pode dar patch em applications.argoproj.io: aguardando o polling do ArgoCD (ate 3 min)."
+          fi
+
+          ALVO=""; [ "$DONO" = "true" ] && ALVO="${ALVO_GITOPS:-$GITHUB_SHA}"
+          SYNC_PEDIDO=false
+          for i in $(seq 1 120); do
+            REV=$($A -o jsonpath='{.status.sync.revision}' 2>/dev/null || true)
+            SYNC=$($A -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            SAUDE=$($A -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            NO_ALVO=true
+            if [ -n "$ALVO" ]; then
+              git cat-file -e "${REV}^{commit}" 2>/dev/null || git fetch origin master --quiet || true
+              git merge-base --is-ancestor "$ALVO" "$REV" 2>/dev/null || NO_ALVO=false
+            fi
+            if $NO_ALVO && [ "$SYNC" = "Synced" ] && [ "$SAUDE" = "Healthy" ]; then
+              echo ">> $APP: Synced + Healthy @ ${REV:0:7}"
+              echo "- ArgoCD \`$APP\`: **Synced + Healthy** @ \`${REV:0:7}\`" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+
+            # O auto-sync nao repete sozinho um sync que falhou na mesma revisao. Se apos
+            # ~60s continuar OutOfSync e sem operacao em andamento, pede o Sync (= botao Sync).
+            if [ "$i" -ge 12 ] && ! $SYNC_PEDIDO && $PODE_PATCH && [ "$SYNC" = "OutOfSync" ] \
+               && [ -z "$($A -o jsonpath='{.operation}' 2>/dev/null)" ]; then
+              PATCH=$(printf '{"operation":{"initiatedBy":{"username":"github-actions (%s)"},"info":[{"name":"Reason","value":"%s #%s (%s)"}],"sync":{"revision":"master","syncOptions":["ApplyOutOfSyncOnly=true","CreateNamespace=true"]}}}' \
+                "$GITHUB_ACTOR" "$GITHUB_WORKFLOW" "$GITHUB_RUN_NUMBER" "$GITHUB_REPOSITORY")
+              kubectl -n argocd patch application.argoproj.io "$APP" --type merge -p "$PATCH" > /dev/null && \
+                echo ">> $APP continuava OutOfSync -- Sync solicitado ao ArgoCD."
+              SYNC_PEDIDO=true
+            fi
+
+            echo ">> $APP: sync=${SYNC:-?} health=${SAUDE:-?} revisao=${REV:0:7} (alvo ${ALVO:0:7}) -- aguardando..."
+            sleep 5
+          done
+
+          echo "::error::$APP nao ficou Synced + Healthy em 10 min."
+          $A -o jsonpath='Operacao: {.status.operationState.phase} -- {.status.operationState.message}{"\n"}' || true
+          $A -o jsonpath='{range .status.resources[*]}  {.kind}/{.name}: {.status} {.health.status} {.health.message}{"\n"}{end}' || true
+          exit 1
+
+      # 1 pod por worker em cada DaemonSet + PONG de cada pod.
+      # Os 2 DaemonSets usam o mesmo label (app: udp-app), entao os pods sao separados
+      # pelo ownerReference (DaemonSet dono), nao pelo label.
+      - name: Verificar DaemonSets (1 pod por worker) e PONG nas portas 1700/1710
+        run: |
+          set -uo pipefail
+          WORKERS=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' --no-headers | wc -l)
+          echo ">> Workers no cluster: $WORKERS (esperado: $WORKERS pods por DaemonSet)"
+          ERRO=0
+
+          {
+            echo "### Plataforma – UDP Health Check (NLB OCI)"
+            echo ""
+            echo "- Repositório: \`${GITHUB_REPOSITORY}\` (dono: **${DONO}**)"
+            echo "- Workers: **${WORKERS}** → esperado ${WORKERS} pods na 1700 e ${WORKERS} na 1710"
+            echo ""
+            echo "| Porta | Nó | Pod | Imagem | PONG (no pod) | PONG (do runner) |"
+            echo "|---|---|---|---|---|---|"
+          } >> $GITHUB_STEP_SUMMARY
+
+          for PAR in "1700:$DS_1700" "1710:$DS_1710"; do
+            PORTA=${PAR%%:*}; DS=${PAR#*:}
+
+            if ! kubectl -n "$NS" rollout status daemonset/"$DS" --timeout=300s; then
+              echo "::error::DaemonSet $DS nao concluiu o rollout."; ERRO=1; continue
+            fi
+
+            DESEJADO=$(kubectl -n "$NS" get daemonset "$DS" -o jsonpath='{.status.desiredNumberScheduled}')
+            PRONTO=$(kubectl -n "$NS" get daemonset "$DS" -o jsonpath='{.status.numberReady}')
+            echo ">> $DS: desejado=$DESEJADO pronto=$PRONTO workers=$WORKERS"
+            if [ "$DESEJADO" != "$WORKERS" ] || [ "$PRONTO" != "$WORKERS" ]; then
+              echo "::error::$DS com $PRONTO/$DESEJADO pods prontos, mas ha $WORKERS workers (taint ou no NotReady?)."
+              kubectl get nodes -o custom-columns='NO:.metadata.name,TAINTS:.spec.taints[*].key,PRONTO:.status.conditions[?(@.type=="Ready")].status' || true
+              ERRO=1
+            fi
+
+            PODS=$(kubectl -n "$NS" get pods -o jsonpath="{range .items[?(@.metadata.ownerReferences[0].name==\"$DS\")]}{.metadata.name} {.spec.nodeName} {.status.hostIP} {.spec.containers[0].image}{\"\n\"}{end}")
+            while read -r POD NO IP IMG; do
+              [ -n "$POD" ] || continue
+
+              # 1) De dentro do pod (hostNetwork): 127.0.0.1:<porta>, independe de firewall.
+              RESP=""
+              for _ in 1 2 3; do
+                RESP=$(kubectl -n "$NS" exec "$POD" -c udp-healthcheck -- \
+                  bash -c "exec 3<>/dev/udp/127.0.0.1/$PORTA; printf PING >&3; timeout 3 head -c 4 <&3" 2>/dev/null || true)
+                [ "$RESP" = "PONG" ] && break
+                sleep 2
+              done
+              if [ "$RESP" = "PONG" ]; then OK_POD="✅ PONG"; else OK_POD="❌ ${RESP:-sem resposta}"; ERRO=1
+                echo "::error::$POD ($NO) nao respondeu PONG na UDP $PORTA."
+              fi
+
+              # 2) Do runner para o IP do no (caminho de rede parecido com o do NLB). So aviso:
+              #    depende da security list liberar UDP entre os nos.
+              RESP2=$(timeout 5 bash -c "exec 3<>/dev/udp/$IP/$PORTA; printf PING >&3; timeout 3 head -c 4 <&3" 2>/dev/null || true)
+              if [ "$RESP2" = "PONG" ]; then OK_RUN="✅ PONG"; else OK_RUN="⚠️ ${RESP2:-sem resposta}"
+                echo "::warning::Runner nao recebeu PONG de $IP:$PORTA ($NO) -- confira a security list (o PONG dentro do pod: $OK_POD)."
+              fi
+
+              echo ">> UDP $PORTA  $NO ($IP)  $POD  pod=$OK_POD  runner=$OK_RUN"
+              echo "| $PORTA | $NO | \`$POD\` | \`${IMG##*/}\` | $OK_POD | $OK_RUN |" >> $GITHUB_STEP_SUMMARY
+            done <<< "$PODS"
+          done
+
+          exit $ERRO
+
+      - name: Pods em execução (depois do deploy)
+        if: always()
+        run: kubectl get daemonset,pods -n "$NS" -o wide || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB: PORTAINER CE (namespace portainer) – administração do cluster
+# Imagem oficial (sem build). O pipeline aplica a base (Namespace e StorageClass/
+# PV/PVC no FSS); quem aplica ServiceAccount, ClusterRoleBinding, Deployment,
+# Service e Ingress e SEMPRE o ArgoCD (Application plataforma-portainer, do
+# repositorio 01). Dono e copias fazem o mesmo: base idempotente + Sync + verificacao.
+# ─────────────────────────────────────────────────────────────────────────────
+  plataforma_portainer:
+    name: Plataforma – Portainer CE
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 30
+    needs: [detect, aprovacao]
+    if: |
+      !cancelled() &&
+      needs.aprovacao.result == 'success' &&
+      needs.detect.outputs.portainer == 'true'
+    env:
+      DONO: ${{ needs.detect.outputs.dono }}
+      APP:  plataforma-portainer
+      K8S:  03.portainer_ce/kubernetes
+      NS:   portainer
+      HOST: portainer.adailsilva.com.br
+      ARQUIVOS: >-
+        02.portainer-ce__ServiceAccount.yaml
+        03.portainer-ce__ClusterRoleBinding.yaml
+        06.portainer-ce__Deployment.yaml
+        07.portainer-ce__Service.yaml
+        10.portainer-ce__Ingress.yaml
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install kubectl
+        run: |
+          mkdir -p /tmp/.kube
+
+          if ! command -v kubectl &> /dev/null; then
+            echo "kubectl não encontrado, instalando..."
+            curl -L "https://dl.k8s.io/release/v1.31.4/bin/linux/arm64/kubectl" -o /tmp/kubectl
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          else
+            echo "kubectl já instalado: $(kubectl version --client 2>/dev/null | head -1)"
+          fi
+
+          echo "${{ secrets.KUBECONFIG }}" > /tmp/.kube/config
+          echo "KUBECONFIG=/tmp/.kube/config" >> $GITHUB_ENV
+
+      - name: Aplicar infraestrutura base do Portainer (Namespace e StorageClass/PV/PVC)
+        run: |
+          set -euo pipefail
+          kubectl apply --server-side -f "$K8S/01.portainer-ce__Namespace.yaml"
+          # Parametros de StorageClass sao imutaveis: se ela ja existe, aplica so o PV e o PVC do arquivo.
+          ARQ="$K8S/05.portainer-ce__StorageClass-PersistenVolume-PersistentVolumeClaim__Attached-with-OCI.yaml"
+          if kubectl get storageclass oci-fss-portainer-data-portainer > /dev/null 2>&1; then
+            echo ">> StorageClass oci-fss-portainer-data-portainer ja existe (parametros imutaveis): mantida."
+            python3 -c 'import sys;print("\n---\n".join(d for d in open(sys.argv[1]).read().split("\n---") if d.strip() and "kind: StorageClass" not in d))' "$ARQ" \
+              | kubectl apply --server-side -f -
+          else
+            kubectl apply --server-side -f "$ARQ"
+          fi
+          kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Bound pvc/oci-fss-pvc-portainer-data-portainer --timeout=120s
+
+      - name: Validar manifestos do ArgoCD (dry-run=server)
+        run: |
+          set -euo pipefail
+          for F in $ARQUIVOS; do
+            kubectl apply --server-side --dry-run=server --force-conflicts -f "$K8S/$F" > /dev/null
+            echo ">> ok: $F"
+          done
+
+      # Mesmo fluxo da plataforma: refresh, espera Synced + Healthy (no dono: no commit
+      # desta execucao ou mais novo) e, se o auto-sync nao andar, solicita o Sync.
+      - name: Sync no ArgoCD (plataforma-portainer)
+        run: |
+          set -uo pipefail
+          A="kubectl -n argocd get application.argoproj.io $APP"
+
+          if ! $A > /dev/null 2>&1; then
+            echo "::error::Application $APP nao existe no ArgoCD. Rode o bootstrap no repositorio ${DONO_PLATAFORMA}: bash gitops/bootstrap/01-aplicar-padrao-argocd.sh"
+            exit 1
+          fi
+
+          PODE_PATCH=false
+          [ "$(kubectl auth can-i patch applications.argoproj.io -n argocd)" = "yes" ] && PODE_PATCH=true
+          if $PODE_PATCH; then
+            kubectl -n argocd annotate application.argoproj.io "$APP" argocd.argoproj.io/refresh=normal --overwrite > /dev/null
+            echo ">> Refresh solicitado em $APP."
+          else
+            echo "::warning::O KUBECONFIG nao pode dar patch em applications.argoproj.io: aguardando o polling do ArgoCD (ate 3 min)."
+          fi
+
+          ALVO=""; [ "$DONO" = "true" ] && ALVO="$GITHUB_SHA"
+          SYNC_PEDIDO=false
+          for i in $(seq 1 120); do
+            REV=$($A -o jsonpath='{.status.sync.revision}' 2>/dev/null || true)
+            SYNC=$($A -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            SAUDE=$($A -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            NO_ALVO=true
+            if [ -n "$ALVO" ]; then
+              git cat-file -e "${REV}^{commit}" 2>/dev/null || git fetch origin master --quiet || true
+              git merge-base --is-ancestor "$ALVO" "$REV" 2>/dev/null || NO_ALVO=false
+            fi
+            if $NO_ALVO && [ "$SYNC" = "Synced" ] && [ "$SAUDE" = "Healthy" ]; then
+              echo ">> $APP: Synced + Healthy @ ${REV:0:7}"
+              echo "- ArgoCD \`$APP\`: **Synced + Healthy** @ \`${REV:0:7}\`" >> $GITHUB_STEP_SUMMARY
+              exit 0
+            fi
+
+            if [ "$i" -ge 12 ] && ! $SYNC_PEDIDO && $PODE_PATCH && [ "$SYNC" = "OutOfSync" ] \
+               && [ -z "$($A -o jsonpath='{.operation}' 2>/dev/null)" ]; then
+              PATCH=$(printf '{"operation":{"initiatedBy":{"username":"github-actions (%s)"},"info":[{"name":"Reason","value":"%s #%s (%s)"}],"sync":{"revision":"master","syncOptions":["ApplyOutOfSyncOnly=true","CreateNamespace=true"]}}}' \
+                "$GITHUB_ACTOR" "$GITHUB_WORKFLOW" "$GITHUB_RUN_NUMBER" "$GITHUB_REPOSITORY")
+              kubectl -n argocd patch application.argoproj.io "$APP" --type merge -p "$PATCH" > /dev/null && \
+                echo ">> $APP continuava OutOfSync -- Sync solicitado ao ArgoCD."
+              SYNC_PEDIDO=true
+            fi
+
+            echo ">> $APP: sync=${SYNC:-?} health=${SAUDE:-?} revisao=${REV:0:7} (alvo ${ALVO:0:7}) -- aguardando..."
+            sleep 5
+          done
+
+          echo "::error::$APP nao ficou Synced + Healthy em 10 min."
+          $A -o jsonpath='Operacao: {.status.operationState.phase} -- {.status.operationState.message}{"\n"}' || true
+          $A -o jsonpath='{range .status.resources[*]}  {.kind}/{.name}: {.status} {.health.status} {.health.message}{"\n"}{end}' || true
+          exit 1
+
+      - name: Verificar Portainer (rollout e HTTPS)
+        run: |
+          set -uo pipefail
+          if ! kubectl -n "$NS" rollout status deployment/portainer-deployment --timeout=300s; then
+            kubectl -n "$NS" logs deployment/portainer-deployment --all-containers --tail=60 || true
+            exit 1
+          fi
+          for _ in $(seq 1 24); do
+            CODIGO=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "https://$HOST/" || true)
+            case "$CODIGO" in
+              200|301|302|307|401)
+                echo ">> https://$HOST respondeu HTTP $CODIGO."
+                {
+                  echo "### Plataforma – Portainer CE"
+                  echo ""
+                  echo "- Repositório: \`${GITHUB_REPOSITORY}\` (dono: **${DONO}**)"
+                  echo "- URL: https://$HOST (HTTP **$CODIGO**)"
+                  echo "- Imagem: \`$(kubectl -n "$NS" get deploy portainer-deployment -o jsonpath='{.spec.template.spec.containers[0].image}')\`"
+                } >> $GITHUB_STEP_SUMMARY
+                exit 0 ;;
+            esac
+            echo ">> https://$HOST respondeu '${CODIGO:-sem resposta}' -- aguardando..."
+            sleep 5
+          done
+          echo "::error::https://$HOST nao respondeu em 2 min."
+          kubectl -n "$NS" get ingress,certificate -o wide || true
+          exit 1

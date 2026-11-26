@@ -1,0 +1,57 @@
+
+---
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: udp-app-with-healthcheck-1700-daemon-set
+  namespace: oci-devops
+  labels:
+    app: udp-app-with-healthcheck-1700-daemon-set
+spec:
+  selector:
+    matchLabels:
+      app: udp-app
+  template:
+    metadata:
+      labels:
+        app: udp-app
+    spec:
+      hostNetwork: true
+      containers:
+#        - name: main-app
+#          image: adailsilva/servico-principal:latest
+#          ports:
+#            - containerPort: 30700
+#              protocol: UDP
+
+        - name: udp-healthcheck
+          image: gru.ocir.io/griszz3l82u1/udp-health-check-server-1700_platform_linux-arm64:latest
+#         args: ["1700"]
+          ports:
+            - containerPort: 1700
+              hostPort: 1700
+              protocol: UDP
+          # Requests explicitos. Sem resources o pod seria BestEffort:
+          # sob disputa de CPU (builds dos runners nos workers, boot de JVM dos
+          # backends) ele receberia a menor fatia do no e poderia demorar a responder
+          # o health check UDP -- o NLB entao marca o no como unhealthy e derruba
+          # o trafego de quem esta saudavel. Valores pequenos: o servidor so
+          # devolve um datagrama por sonda.
+          # A JVM sem limite de memoria dimensiona o heap pela RAM do no (7Gi);
+          # com o limite abaixo ela passa a enxergar 192Mi e o heap fica em ~64Mi (folga para metaspace e threads).
+          env:
+            # Porta que o servidor escuta. Prevalece sobre o valor gravado na imagem.
+            - name: UDP_PORT
+              value: "1700"
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=33 -XX:+UseSerialGC -Xss256k -XX:TieredStopAtLevel=1"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "10m"
+            limits:
+              memory: "192Mi"
+              cpu: "100m"
+      imagePullSecrets:
+        - name: oci-registry-secret

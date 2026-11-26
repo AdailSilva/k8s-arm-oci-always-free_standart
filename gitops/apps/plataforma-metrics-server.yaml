@@ -1,0 +1,38 @@
+# metrics-server (kubectl top, HPA)
+# Padrão de nome: <projeto>-<sistema>-<componente>  ·  AppProject 00-plataforma  ·  ver gitops/PADRAO-ARGOCD.md
+# Modo INFRA: infraestrutura compartilhada do cluster. Só o repositório 01 (k8s-arm-oci-always-free_standart)
+# vincula esta pasta ao ArgoCD; as cópias idênticas dos outros repositórios são só modelo.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: plataforma-metrics-server
+  namespace: argocd
+  labels:
+    adailsilva.com.br/repositorio: k8s-arm-oci-always-free_standart
+    adailsilva.com.br/projeto: "plataforma"
+    adailsilva.com.br/sistema: cluster
+    adailsilva.com.br/componente: metrics-server
+    adailsilva.com.br/implantacao: argocd
+spec:
+  project: 00-plataforma
+  info:
+    - name: Pasta
+      value: 01.metrics_server/kubernetes
+    - name: Implantação
+      value: "ArgoCD aplica (automático, selfHeal); o pipeline main.yml (job plataforma_metrics_server) valida, pede o Sync e verifica. Apagar a Application NÃO apaga os recursos"
+  source:
+    repoURL: https://github.com/AdailSilva/k8s-arm-oci-always-free_standart.git
+    targetRevision: master
+    path: 01.metrics_server/kubernetes
+    directory:
+      recurse: false
+      include: '{02.metrics-server__ServiceAccount.yaml,03.metrics-server__ClusterRole.yaml,04.metrics-server__RoleBinding.yaml,06.metrics-server__Deployment.yaml,07.metrics-server__Service.yaml,08.metrics-server__ApiService.yaml}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated: { prune: false, selfHeal: true }
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
+      - CreateNamespace=true
+  revisionHistoryLimit: 20

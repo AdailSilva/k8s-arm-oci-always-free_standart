@@ -1,0 +1,56 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// Formulários sem quebra: nenhum campo fica maior que a sua coluna.
+//
+// Os componentes de entrada do PrimeNG (número, seleção, data, autocomplete, senha) têm
+// largura própria e, numa grade estreita, passavam por cima da coluna vizinha, criavam
+// rolagem lateral no diálogo e escondiam o placeholder do campo ao lado. Aqui eles
+// ocupam a largura da coluna e podem encolher junto com ela.
+//
+// Fica na camada "components": qualquer utilitário de largura da própria tela (w-*,
+// sm:w-*, inputStyleClass="w-16"...) continua valendo por cima destas regras.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+@layer components {
+    // Item de grade (Tailwind grid) pode encolher abaixo da largura mínima do conteúdo.
+    .grid > * {
+        min-width: 0;
+    }
+
+    // Campo dentro de um bloco "rótulo + campo" (flex coluna) ocupa a coluna inteira.
+    // Campo com largura explícita (classe w-*, ex.: filtros "w-full sm:w-64") mantém a sua.
+    .flex-col > :is(.p-inputnumber, .p-select, .p-multiselect, .p-datepicker, .p-autocomplete,
+            .p-password, .p-cascadeselect, .p-treeselect, .p-inputtext, .p-textarea, .p-inputgroup, .p-iconfield):not([class^='w-'], [class*=' w-'], [class*=':w-']) {
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+    }
+
+    // O <input> interno acompanha o componente (inclusive com os botões +/− ou do calendário),
+    // salvo quando recebeu largura explícita (inputStyleClass="w-16", por exemplo).
+    .p-inputnumber > .p-inputnumber-input:not([class^='w-'], [class*=' w-'], [class*=':w-']),
+    .p-datepicker > .p-datepicker-input:not([class^='w-'], [class*=' w-'], [class*=':w-']),
+    .p-password > .p-password-input:not([class^='w-'], [class*=' w-'], [class*=':w-']),
+    .p-autocomplete > .p-autocomplete-input:not([class^='w-'], [class*=' w-'], [class*=':w-']) {
+        width: 100%;
+        min-width: 0;
+    }
+    .p-inputnumber,
+    .p-datepicker,
+    .p-password,
+    .p-autocomplete {
+        min-width: 0;
+    }
+
+    // Seleção: o texto escolhido encolhe com reticências em vez de empurrar os ícones.
+    .p-select .p-select-label,
+    .p-multiselect .p-multiselect-label {
+        min-width: 0;
+    }
+
+    // Grupo de botões de escolha (selectbutton): numa tela estreita as opções quebram de linha
+    // em vez de passar da borda do cartão ou do diálogo.
+    .p-selectbutton {
+        flex-wrap: wrap;
+        max-width: 100%;
+    }
+}

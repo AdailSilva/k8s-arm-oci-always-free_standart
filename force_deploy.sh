@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# =============================================================================
+# force_deploy.sh — Force Deploy dos projetos Adail Silva (plataforma 01–03 e site k8s.adailsilva.com.br)
+#                  Repositório: AdailSilva/k8s-arm-oci-always-free_standart
+# -----------------------------------------------------------------------------
+# Em vez de alterar os Dockerfiles, grava/atualiza o arquivo ".force-deploy"
+# em cada diretório de projeto com data/hora e um ID único. Como o arquivo
+# muda a cada execução, o paths-filter do workflow detecta alteração em todos
+# os diretórios e dispara o build + deploy de cada job.
+#
+# Uso:
+#   ./force_deploy.sh                    # todos os projetos
+#   ./force_deploy.sh site                # apenas os que contêm "site"
+#   ./force_deploy.sh --no-push          # gera commit, mas não faz push
+#   ./force_deploy.sh --dry-run          # só mostra o que seria feito
+# =============================================================================
+set -euo pipefail
+
+PROJECTS=(
+  # Plataforma do cluster (jobs metrics_server/udp_health_check/portainer do .github/workflows/main.yml) -- deploy sempre pelo ArgoCD.
+  # No repositorio 01 builda/grava newTag; nos demais faz Sync no ArgoCD + verificacao.
+  "01.metrics_server"
+  "02.udp_health_check-nlb_oci"
+  "03.portainer_ce"
+  # Sistemas deste repositorio (job app_adailsilva_site_frontend do .github/workflows/main.yml)
+  "04.homepage/app_adailsilva_site_frontend"
+)
+
+TRIGGER_FILE=".force-deploy"
+DEPLOY_BRANCH="master"
+PUSH=true
+DRY_RUN=false
+FILTERS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-push) PUSH=false ;;
+    --dry-run) DRY_RUN=true ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    *) FILTERS+=("$arg") ;;
+  esac
+done
+
+# --- Vai para a raiz do repositório -----------------------------------------
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "❌ Execute dentro do repositório Git."; exit 1; }
+cd "$REPO_ROOT"
+
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "$CURRENT_BRANCH" != "$DEPLOY_BRANCH" ]]; then
+  echo "⚠️  Branch atual: '$CURRENT_BRANCH' (o pipeline dispara em '$DEPLOY_BRANCH')."
+  read -r -p "Continuar mesmo assim? [s/N] " ans
+  [[ "$ans" =~ ^[sS]$ ]] || exit 1
+fi
+
+# --- Seleção dos projetos ----------------------------------------------------
+SELECTED=()
+for p in "${PROJECTS[@]}"; do
+  if [[ ${#FILTERS[@]} -eq 0 ]]; then
+    SELECTED+=("$p")
+  else
+    for f in "${FILTERS[@]}"; do
+      [[ "$p" == *"$f"* ]] && { SELECTED+=("$p"); break; }
+    done
+  fi
+done
+
+[[ ${#SELECTED[@]} -gt 0 ]] || { echo "❌ Nenhum projeto corresponde ao filtro."; exit 1; }
+
+# --- Gera os arquivos de gatilho ---------------------------------------------
+TIMESTAMP="$(TZ=America/Fortaleza date '+%Y-%m-%d %H:%M:%S %z')"
+DEPLOY_ID="$(date +%s)-$RANDOM"
+AUTHOR="$(git config user.name || echo desconhecido)"
+FILES=()
+
+echo "🚀 Force Deploy — $TIMESTAMP (id: $DEPLOY_ID)"
+for p in "${SELECTED[@]}"; do
+  if [[ ! -d "$p" ]]; then
+    echo "   ⚠️  Ignorado (diretório não existe): $p"; continue
+  fi
+  # App Flutter ainda não criado (pasta *_mobile sem pubspec.yaml): não há o que buildar.
+  if [[ "$p" == *_mobile && ! -f "$p/pubspec.yaml" ]]; then
+    echo "   ⚠️  Ignorado (app Flutter ainda não criado, sem pubspec.yaml): $p"; continue
+  fi
+  FILE="$p/$TRIGGER_FILE"
+  FILES+=("$FILE")
+  echo "   ✔ $FILE"
+  $DRY_RUN && continue
+  cat > "$FILE" <<CONTENT
+# Arquivo gerado automaticamente por force_deploy.sh
+# Qualquer alteração aqui dispara o pipeline (paths-filter) deste projeto.
+# Não editar manualmente.
+project=$p
+deploy_at=$TIMESTAMP
+deploy_id=$DEPLOY_ID
+author=$AUTHOR
+CONTENT
+done
+
+[[ ${#FILES[@]} -gt 0 ]] || { echo "❌ Nenhum arquivo gerado."; exit 1; }
+$DRY_RUN && { echo "ℹ️  Dry-run: nada foi alterado."; exit 0; }
+
+# --- Commit apenas dos arquivos de gatilho (não leva outras alterações) ------
+git add -- "${FILES[@]}"
+git commit -m "Force Deploy" -m "deploy_id: $DEPLOY_ID | $TIMESTAMP" -- "${FILES[@]}"
+
+# --- Push ---------------------------------------------------------------------
+# O pipeline faz commit de volta no master a cada deploy (passo "Fixar versão no
+# GitOps" atualiza o newTag dos kustomization.yaml). Depois de qualquer execução
+# do pipeline, o master local fica ATRÁS do remoto e um `git push` direto é
+# rejeitado (non-fast-forward) -- com `set -e`, o script morria ali e o push
+# tinha de ser feito à mão. Agora: pull --rebase antes do push, com até 3
+# tentativas (o pipeline pode empurrar outro commit entre o pull e o push).
+# --autostash protege alterações locais não commitadas durante o rebase.
+if $PUSH; then
+  for tentativa in 1 2 3; do
+    echo "🔄 Sincronizando com origin/$CURRENT_BRANCH (tentativa $tentativa/3)..."
+    if ! git pull --rebase --autostash origin "$CURRENT_BRANCH"; then
+      git rebase --abort 2>/dev/null || true
+      echo "❌ Conflito ao sincronizar com origin/$CURRENT_BRANCH."
+      echo "   O commit 'Force Deploy' continua local. Resolva e rode:"
+      echo "   git pull --rebase origin $CURRENT_BRANCH && git push origin $CURRENT_BRANCH"
+      exit 1
+    fi
+    if git push origin "$CURRENT_BRANCH"; then
+      echo "✅ Push enviado — acompanhe em GitHub → Actions."
+      exit 0
+    fi
+    echo "⚠️  Push rejeitado (o remoto mudou de novo). Tentando outra vez em 5s..."
+    sleep 5
+  done
+  echo "❌ Push não concluído após 3 tentativas. Rode: git pull --rebase origin $CURRENT_BRANCH && git push origin $CURRENT_BRANCH"
+  exit 1
+else
+  echo "✅ Commit criado (sem push). Rode: git push origin $CURRENT_BRANCH"
+fi

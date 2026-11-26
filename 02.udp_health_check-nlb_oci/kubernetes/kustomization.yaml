@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Application plataforma-udp-health-check (AppProject 00-plataforma, repositorio 01).
+# O ArgoCD renderiza SOMENTE os 2 DaemonSets (1 pod por worker em cada um).
+# Namespace oci-devops: CreateNamespace=true na Application (o pipeline cria se faltar).
+# imagePullSecret oci-registry-secret: criado pelo pipeline (nao vai para o Git).
+resources:
+  - 02.udp-health-check-server-1700__DaemonSet.yaml
+  - 03.udp-health-check-server-1710__DaemonSet.yaml
+
+images:
+  # Repositorios OCIR udp-health-check-server-1700/1710_platform_linux-arm64.
+  # newTag atualizado pelo pipeline do repositorio 01 (.github/workflows/main.yml, job plataforma_udp_health_check)
+  # a cada build -- as duas portas recebem a mesma versao (mesmo codigo).
+  # "latest" so ate o primeiro build; o pipeline troca pela versao (0.1, 0.2...).
+  # Para congelar o rollout: adicione a linha "# plataforma-release-congelado: <motivo>".
+  # Nos repositorios 02 a 06 este arquivo e so copia/modelo (nao e atualizado).
+  - name: gru.ocir.io/griszz3l82u1/udp-health-check-server-1700_platform_linux-arm64
+    newTag: "1.10"
+  - name: gru.ocir.io/griszz3l82u1/udp-health-check-server-1710_platform_linux-arm64
+    newTag: "1.10"

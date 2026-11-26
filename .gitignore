@@ -1,0 +1,13 @@
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+variables.auto.tfvars
+
+# ── IDEs (configuração local de cada máquina; nunca versionar) ────────────────
+.classpath
+.project
+.factorypath
+.settings/
+.vscode/
+.idea/
+*.iml

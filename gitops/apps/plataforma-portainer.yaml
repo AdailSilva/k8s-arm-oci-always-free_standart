@@ -1,0 +1,36 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: plataforma-portainer
+  namespace: argocd
+  labels:
+    adailsilva.com.br/repositorio: k8s-arm-oci-always-free_standart
+    adailsilva.com.br/projeto: "plataforma"
+    adailsilva.com.br/sistema: cluster
+    adailsilva.com.br/componente: portainer
+    adailsilva.com.br/implantacao: argocd
+  annotations:
+    link.argocd.argoproj.io/external-link: https://portainer.adailsilva.com.br
+spec:
+  project: 00-plataforma
+  info:
+    - name: Pasta
+      value: 03.portainer_ce/kubernetes
+    - name: Implantação
+      value: "ArgoCD aplica ServiceAccount, ClusterRoleBinding, Deployment, Service e Ingress (automático, selfHeal); o pipeline main.yml (job plataforma_portainer) aplica Namespace e StorageClass/PV/PVC, pede o Sync e verifica. Apagar a Application NÃO apaga os recursos"
+  source:
+    repoURL: https://github.com/AdailSilva/k8s-arm-oci-always-free_standart.git
+    targetRevision: master
+    path: 03.portainer_ce/kubernetes
+    directory:
+      recurse: false
+      include: '{02.portainer-ce__ServiceAccount.yaml,03.portainer-ce__ClusterRoleBinding.yaml,06.portainer-ce__Deployment.yaml,07.portainer-ce__Service.yaml,10.portainer-ce__Ingress.yaml}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: portainer
+  syncPolicy:
+    automated: { prune: false, selfHeal: true }
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
+      - CreateNamespace=true
+  revisionHistoryLimit: 20

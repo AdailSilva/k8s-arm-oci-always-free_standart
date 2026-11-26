@@ -1,0 +1,40 @@
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: portainer-service
+  namespace: portainer
+  labels:
+    io.portainer.kubernetes.application.stack: portainer-service
+    app.kubernetes.io/name: portainer-service
+    app.kubernetes.io/instance: portainer-deployment
+    app.kubernetes.io/version: "ce-latest-ee-2.15.1"
+spec:
+  # clusterIP: "None"
+  type: ClusterIP #"ClusterIP", "ExternalName", "LoadBalancer", "NodePort"
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: "tcp-edge-8000-to-8000"
+      #nodePort: 30776
+    - port: 9000
+      targetPort: 9000
+      protocol: TCP
+      name: "http-9000-to-9000"
+      #nodePort: 30777
+    - port: 443 # This port will be used by ingress.
+      targetPort: 9443
+      protocol: TCP
+      name: "https-9443-to-443"
+      #nodePort: 30778
+    # - port: 9443
+    #   targetPort: 9443
+    #   protocol: TCP
+    #   name: "https-9443-to-9443"
+    #   #nodePort: 30779
+  selector:
+    app.kubernetes.io/name: portainer-deployment
+    app.kubernetes.io/instance: portainer-deployment

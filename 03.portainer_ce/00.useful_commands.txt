@@ -1,0 +1,21 @@
+# Useful Commands:
+
+chmod +x 01.deploy_portainer_script.sh
+bash 01.deploy_portainer_script.sh
+
+chmod +x 02.destroy_portainer_script.sh
+bash 02.destroy_portainer_script.sh
+
+
+
+# Port Forward
+
+## Context - Example:
+
+Pod: portainer-deployment-767c98b99b-7xtpz
+Service: portainer-service
+Namespace: portainer
+
+## Porta do container (Portainer): geralmente 9443
+kubectl port-forward pod/portainer-deployment-6f64687cbf-l88g2 9443:9443 -n portainer
+kubectl port-forward pod/portainer-deployment-6f64687cbf-l88g2 9444:9443 -n portainer (9444 Local)

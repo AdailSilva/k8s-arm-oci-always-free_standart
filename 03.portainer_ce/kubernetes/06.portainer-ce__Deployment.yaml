@@ -1,0 +1,81 @@
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portainer-deployment
+  namespace: portainer
+  labels:
+    io.portainer.kubernetes.application.stack: portainer-deployment
+    app.kubernetes.io/name: portainer-deployment
+    app.kubernetes.io/instance: portainer-deployment
+    app.kubernetes.io/version: "ce-latest-ee-2.39.1"
+spec:
+  replicas: 1
+  strategy:
+    type: "Recreate"
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: portainer-deployment
+      app.kubernetes.io/instance: portainer-deployment
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portainer-deployment
+        app.kubernetes.io/instance: portainer-deployment
+    spec:
+      nodeSelector: {}
+      serviceAccountName: portainer-sa-clusteradmin
+      # Pod-level securityContext para controlar dono/grupo dos mounts
+      securityContext:
+        runAsUser: 1000
+        fsGroup: 1000
+        runAsGroup: 1000
+        runAsNonRoot: false
+      initContainers:
+        - name: fix-permissions-portainer
+          image: busybox:1.37.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              mkdir -p /data
+              chmod -R 770 /data
+              chown -R 1000:1000 /data || true
+          volumeMounts:
+            - name: oci-fss-pvc-portainer-data-portainer
+              mountPath: /data
+      containers:
+        - name: portainer
+          image: "portainer/portainer-ce:2.39.1"
+          imagePullPolicy: Always
+          args:
+            - "--http-enabled"
+          ports:
+            - name: http
+              containerPort: 9000
+              protocol: TCP
+            - name: https
+              containerPort: 9443
+              protocol: TCP
+            - name: tcp-edge
+              containerPort: 8000
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9443
+              scheme: HTTPS
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9443
+              scheme: HTTPS
+          resources: {}
+          volumeMounts:
+            - name: oci-fss-pvc-portainer-data-portainer
+              mountPath: /data
+      volumes:
+        - name: oci-fss-pvc-portainer-data-portainer
+          persistentVolumeClaim:
+            claimName: oci-fss-pvc-portainer-data-portainer

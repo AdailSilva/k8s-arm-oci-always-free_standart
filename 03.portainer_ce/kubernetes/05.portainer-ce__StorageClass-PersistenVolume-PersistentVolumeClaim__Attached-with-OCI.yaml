@@ -1,0 +1,58 @@
+#####################
+# Attached with OCI #
+#####################
+
+---
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: oci-fss-portainer-data-portainer
+  # namespace: portainer
+provisioner: oracle.com/oci-fss
+parameters:
+  mntTargetId: ocid1.mounttarget.oc1.sa_saopaulo_1.aaaaaa4np2xizkpzm5zhkllqojxwiottmewxgylpobqxk3dpfuys2ylefuyqaaaa
+
+---
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: oci-fss-pv-portainer-data-portainer
+  # namespace: portainer
+spec:
+  storageClassName: oci-fss-portainer-data-portainer
+  capacity:
+    storage: 10Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - nosuid
+    - vers=3        # ou vers=4.1 (dependendo do que você quiser usar)
+    - rsize=1048576
+    - wsize=1048576
+    - hard
+    - timeo=600
+    - retrans=2
+  nfs:
+    server: 10.0.0.143
+    path: "/FileSystem-K8S/portainer-data"
+    readOnly: false
+  persistentVolumeReclaimPolicy: Retain
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oci-fss-pvc-portainer-data-portainer
+  namespace: portainer
+spec:
+  storageClassName: oci-fss-portainer-data-portainer
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  volumeName: oci-fss-pv-portainer-data-portainer

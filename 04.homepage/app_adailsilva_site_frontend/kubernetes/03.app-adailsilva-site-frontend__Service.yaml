@@ -1,0 +1,17 @@
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-adailsilva-site-frontend-service
+  namespace: adailsilva-site
+spec:
+  type: ClusterIP
+  selector:
+    app: app-adailsilva-site-frontend-deployment
+    component: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

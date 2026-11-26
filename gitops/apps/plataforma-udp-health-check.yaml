@@ -1,0 +1,37 @@
+# Health check UDP 1700/1710 do NLB da OCI (DaemonSets)
+# Padrão de nome: <projeto>-<sistema>-<componente>  ·  AppProject 00-plataforma  ·  ver gitops/PADRAO-ARGOCD.md
+# Modo INFRA: infraestrutura compartilhada do cluster. Só o repositório 01 (k8s-arm-oci-always-free_standart)
+# vincula esta pasta ao ArgoCD; as cópias idênticas dos outros repositórios são só modelo.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: plataforma-udp-health-check
+  namespace: argocd
+  labels:
+    adailsilva.com.br/repositorio: k8s-arm-oci-always-free_standart
+    adailsilva.com.br/projeto: "plataforma"
+    adailsilva.com.br/sistema: cluster
+    adailsilva.com.br/componente: udp-health-check
+    adailsilva.com.br/implantacao: argocd
+spec:
+  project: 00-plataforma
+  info:
+    - name: Pasta
+      value: 02.udp_health_check-nlb_oci/kubernetes
+    - name: Implantação
+      value: "Pipeline main.yml (job plataforma_udp_health_check) publica as imagens e grava o newTag; o ArgoCD aplica (automático, selfHeal). Apagar a Application NÃO apaga os recursos"
+  source:
+    repoURL: https://github.com/AdailSilva/k8s-arm-oci-always-free_standart.git
+    targetRevision: master
+    # kustomization.yaml: renderiza so os 2 DaemonSets e fixa o newTag das
+    # imagens 1700/1710 -- gravado pelo .github/workflows/main.yml (job plataforma_udp_health_check) (padrao GitOps).
+    path: 02.udp_health_check-nlb_oci/kubernetes
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: oci-devops
+  syncPolicy:
+    automated: { prune: false, selfHeal: true }
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
+      - CreateNamespace=true
+  revisionHistoryLimit: 20

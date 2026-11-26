@@ -1,0 +1,7 @@
+# Arquivo gerado automaticamente por force_deploy.sh
+# Qualquer alteração aqui dispara o pipeline (paths-filter) deste projeto.
+# Não editar manualmente.
+project=01.metrics_server
+deploy_at=2026-11-23 16:19:50 -0300
+deploy_id=1795461590-1750
+author=Adail dos Santos Silva
