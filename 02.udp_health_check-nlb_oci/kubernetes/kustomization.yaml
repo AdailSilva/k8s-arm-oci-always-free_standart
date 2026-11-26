@@ -17,6 +17,6 @@ images:
   # Para congelar o rollout: adicione a linha "# plataforma-release-congelado: <motivo>".
   # Nos repositorios 02 a 06 este arquivo e so copia/modelo (nao e atualizado).
   - name: gru.ocir.io/griszz3l82u1/udp-health-check-server-1700_platform_linux-arm64
-    newTag: "1.10"
+    newTag: "1.11"
   - name: gru.ocir.io/griszz3l82u1/udp-health-check-server-1710_platform_linux-arm64
-    newTag: "1.10"
+    newTag: "1.11"
