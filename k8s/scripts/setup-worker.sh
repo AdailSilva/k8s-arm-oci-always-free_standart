@@ -10,4 +10,6 @@ sudo kubeadm join \
   --discovery-token-unsafe-skip-ca-verification \
   ${leader_url}:6443
   
-kubectl label node ${node_name} node-role.kubernetes.io/worker=worker
+# --overwrite: numa reexecução (taint do worker_setup) o label já existe e, sem ele, o
+# kubectl sai com erro -> o provisioner do Terraform falha no último passo.
+kubectl label node ${node_name} node-role.kubernetes.io/worker=worker --overwrite
