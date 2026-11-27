@@ -11,3 +11,6 @@ variables.auto.tfvars
 .vscode/
 .idea/
 *.iml
+
+# ── Credenciais e chaves da OCI (00.oci): ficam só na máquina, nunca versionar ─
+00.oci/
